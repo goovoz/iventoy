@@ -7,7 +7,7 @@ The image is based on Debian 12 Bookworm slim. iVentoy runs in foreground mode s
 ## Versions
 
 Docker Tag:
-* latest / 1.0.39: iVentoy v1.0.39
+* latest / 1.0.45: iVentoy v1.0.45
 
 ## Usage
 
@@ -79,3 +79,14 @@ Once your container is up and running go to the IP address of your server on por
 
 5. Test booting.
 ![picture of iVentoy configuration 1](docs/assets/scr6.png)
+
+
+## Automatic Version Tracking
+
+This fork follows the official iVentoy releases from [ventoy/PXE](https://github.com/ventoy/PXE/releases) automatically:
+
+- A scheduled GitHub Actions workflow (`.github/workflows/track-iventoy-release.yml`) checks the upstream release feed every day.
+- When a new stable version appears, it bumps the version references in `Dockerfile`, `Makefile`, `docker-compose.yml` and `README.md`, pushes the commit to `main`, creates a `vX.Y.Z` tag, and triggers the multi-arch image build.
+- If the upstream version matches the version in this repository, nothing is pushed.
+
+You can also run it manually: **Actions → "Track iVentoy Upstream Release" → Run workflow** (optionally pinning an explicit version). See [docs/UPSTREAM-SYNC.md](docs/UPSTREAM-SYNC.md) for the full mechanism.

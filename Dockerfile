@@ -3,7 +3,7 @@ LABEL maintainer="czytcn@gmail.com"
 
 ENV DEBIAN_FRONTEND=noninteractive
 ARG IVENTOY_VERSION
-ENV IVENTOY_VERSION=${IVENTOY_VERSION:-1.0.39}
+ENV IVENTOY_VERSION=${IVENTOY_VERSION:-1.0.45}
 
 RUN apt-get update && apt-get install -y --no-install-recommends curl libglib2.0-dev libevent-dev libwim-dev && \
     rm -rf /var/lib/apt/lists/*

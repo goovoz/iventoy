@@ -4,7 +4,7 @@ services:
         build:
             context: .
             args:
-                IVENTOY_VERSION: "1.0.39"
+                IVENTOY_VERSION: "1.0.45"
         image: czyt/iventoy:latest
         container_name: iventoy
         restart: unless-stopped

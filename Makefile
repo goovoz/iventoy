@@ -8,11 +8,11 @@ buildx:
 
 tag:
 	docker tag iventoy:build garybowers/iventoy:latest
-	docker tag iventoy:build garybowers/iventoy:1.0.39
+	docker tag iventoy:build garybowers/iventoy:1.0.45
 
 push:
 	docker push garybowers/iventoy:latest
-	docker push garybowers/iventoy:1.0.39
+	docker push garybowers/iventoy:1.0.45
 
 test:
 	sh tests/test-container-entrypoint.sh
