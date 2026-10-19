@@ -1,0 +1,12 @@
+# fork 自有路径清单（L0 新增文件）
+# 纪律：新增自有文件必须登记到本文件，否则重建/同步 main 时会丢失。
+# 同步/重建 main 的脚本按本清单保留自有文件；注释与空行会被跳过。
+.github/workflows/track-iventoy-release.yml
+.github/fork-paths.txt
+docs/UPSTREAM-SYNC.md
+
+# L1 对上游文件的最小改动（均带 [iventoy-fork] 锚点注释，只增不改语义）：
+#   .github/workflows/docker-publish.yml
+#
+# 以下文件的版本字符串由 track-iventoy-release.yml 自动维护，请勿手动长期偏离：
+#   Dockerfile / Makefile / docker-compose.yml / README.md

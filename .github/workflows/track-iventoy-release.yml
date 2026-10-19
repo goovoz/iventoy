@@ -1,0 +1,149 @@
+name: Track iVentoy Upstream Release
+
+# 自动跟随 iVentoy 官方发布（https://github.com/ventoy/PXE/releases）。
+# 上游出现新的稳定版时：自动改版本引用 -> 提交推送 main -> 打 vX.Y.Z 标签 -> 触发镜像构建发布。
+# 上游无新版本时每天空跑退出，不做任何推送。机制详见 docs/UPSTREAM-SYNC.md。
+
+on:
+  schedule:
+    - cron: "37 18 * * *" # 每天 18:37 UTC（北京时间次日 02:37）
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "手动指定 iVentoy 版本（留空则自动获取上游最新稳定版）"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: track-iventoy-release
+  cancel-in-progress: false
+
+jobs:
+  track:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 获取上游最新版本
+        id: latest
+        run: |
+          set -euo pipefail
+          if [[ -n "${{ inputs.version }}" ]]; then
+            LATEST="${{ inputs.version }}"
+          else
+            LATEST=$(curl -fsSL \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              https://api.github.com/repos/ventoy/PXE/releases/latest \
+              | jq -r '.tag_name' | sed 's/^v//')
+          fi
+          if [[ ! "$LATEST" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::无法从上游解析出版本号: '$LATEST'（tag 命名可能已变更，需人工处理）"
+            exit 1
+          fi
+          echo "version=$LATEST" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 读取仓库当前版本
+        id: current
+        run: |
+          set -euo pipefail
+          CURRENT=$(grep -oP 'IVENTOY_VERSION:-\K[0-9][0-9.]*' Dockerfile | head -1)
+          if [[ -z "$CURRENT" ]]; then
+            echo "::error::Dockerfile 中未找到 IVENTOY_VERSION 默认值"
+            exit 1
+          fi
+          echo "version=$CURRENT" >> "$GITHUB_OUTPUT"
+
+      - name: 校验上游发布资产齐全
+        id: assets
+        run: |
+          set -euo pipefail
+          V="${{ steps.latest.outputs.version }}"
+          NAMES=$(curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/ventoy/PXE/releases/tags/v${V}" \
+            | jq -r '.assets[].name')
+          for f in "iventoy-${V}-linux-x86_64-free.tar.gz" "iventoy-${V}-linux-arm64-trial.tar.gz"; do
+            if ! grep -qxF "$f" <<< "$NAMES"; then
+              echo "::error::上游 v${V} 缺少构建所需资产: $f（命名可能已变更，需人工处理）"
+              exit 1
+            fi
+          done
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 更新版本引用并推送
+        if: steps.latest.outputs.version != steps.current.outputs.version
+        run: |
+          set -euo pipefail
+          OLD="${{ steps.current.outputs.version }}"
+          NEW="${{ steps.latest.outputs.version }}"
+          # [iventoy-fork] 以下四处版本引用由本 workflow 自动维护，改动模式前先读 docs/UPSTREAM-SYNC.md
+          sed -i "s|\${IVENTOY_VERSION:-${OLD}}|\${IVENTOY_VERSION:-${NEW}}|" Dockerfile
+          sed -i "s|iventoy:${OLD}|iventoy:${NEW}|g" Makefile
+          sed -i "s|\"${OLD}\"|\"${NEW}\"|" docker-compose.yml
+          sed -i "s|/ ${OLD}: iVentoy v${OLD}|/ ${NEW}: iVentoy v${NEW}|" README.md
+          if git diff --quiet; then
+            echo "::error::版本 ${OLD} -> ${NEW}，但没有任何文件被改动，疑似引用模式失效，终止推送"
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "chore: auto-update iVentoy ${OLD} -> ${NEW}"
+          git push origin HEAD:main
+
+      - name: 创建版本标签
+        if: steps.latest.outputs.version != steps.current.outputs.version
+        run: |
+          set -euo pipefail
+          TAG="v${{ steps.latest.outputs.version }}"
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "标签 ${TAG} 已存在，跳过创建"
+          else
+            git tag "$TAG"
+            git push origin "refs/tags/${TAG}"
+          fi
+
+      - name: 触发镜像构建发布
+        if: steps.latest.outputs.version != steps.current.outputs.version
+        run: |
+          set -euo pipefail
+          TAG="v${{ steps.latest.outputs.version }}"
+          # workflow_dispatch 是 GITHUB_TOKEN 触发级联的法定例外，可正常创建新 run
+          curl -fsSL -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/docker-publish.yml/dispatches" \
+            -d "{\"ref\":\"refs/tags/${TAG}\"}"
+          echo "已派发 docker-publish.yml @ refs/tags/${TAG}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 结果汇总
+        if: always()
+        run: |
+          OLD="${{ steps.current.outputs.version }}"
+          NEW="${{ steps.latest.outputs.version }}"
+          {
+            echo "### iVentoy 上游版本跟踪"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 上游最新 | ${NEW:-<获取失败>} |"
+            echo "| 仓库更新前 | ${OLD:-<读取失败>} |"
+            if [[ -n "$NEW" && "$NEW" != "$OLD" ]]; then
+              echo "| 操作 | 已更新版本引用、创建标签 refs/tags/v${NEW} 并触发镜像构建 |"
+            else
+              echo "| 操作 | 已是最新，无需更新 |"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

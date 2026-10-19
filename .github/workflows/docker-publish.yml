@@ -24,8 +24,33 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # [iventoy-fork L1] fork 不继承上游仓库的 secrets。未配置 Docker Hub 凭据时
+      # 只发布到 ghcr.io，避免 login/push 步骤直接失败。
+      - name: Resolve publish targets
+        id: targets
+        run: |
+          set -euo pipefail
+          GHCR_IMAGE="ghcr.io/${{ github.repository_owner }}/${{ env.REGISTRY_IMAGE }}"
+          if [[ -n "${{ secrets.DOCKERHUB_USERNAME }}" && -n "${{ secrets.DOCKERHUB_TOKEN }}" ]]; then
+            echo "dockerhub=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "images<<EOF"
+              echo "${{ secrets.DOCKERHUB_USERNAME }}/${{ env.REGISTRY_IMAGE }}"
+              echo "$GHCR_IMAGE"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "dockerhub=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::未配置 DOCKERHUB_USERNAME / DOCKERHUB_TOKEN secrets，本次仅发布到 ghcr.io"
+            {
+              echo "images<<EOF"
+              echo "$GHCR_IMAGE"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Login to Docker Hub
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && steps.targets.outputs.dockerhub == 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -39,26 +64,29 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract version from tag
+      # [iventoy-fork L1] tag 事件取 tag 版本；其余触发（含 track-iventoy-release.yml
+      # 的派发与手动 dispatch）改为读取 Dockerfile 当前默认版本。
+      # 原实现为非 tag 时硬编码回退值，会构建出过期版本。
+      - name: Extract version
         id: version
         run: |
           if [[ "${{ github.ref }}" == refs/tags/* ]]; then
             VERSION=${GITHUB_REF#refs/tags/}
             VERSION=${VERSION#v}
-            echo "iventoy_version=${VERSION}" >> $GITHUB_OUTPUT
           else
-            echo "iventoy_version=1.0.21" >> $GITHUB_OUTPUT
+            VERSION=$(grep -oP 'IVENTOY_VERSION:-\K[0-9][0-9.]*' Dockerfile | head -1)
           fi
+          echo "iventoy_version=${VERSION}" >> $GITHUB_OUTPUT
 
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: |
-            ${{ env.DOCKER_HUB_USERNAME }}/${{ env.REGISTRY_IMAGE }}
-            ghcr.io/${{ github.repository_owner }}/${{ env.REGISTRY_IMAGE }}
+          images: ${{ steps.targets.outputs.images }}
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
+            # [iventoy-fork L1] is_default_branch 对 tag ref 恒为 false，原配置导致 :latest 永不刷新；
+            # 改为所有非 PR 构建都更新 latest。
+            type=raw,value=latest,enable=${{ github.event_name != 'pull_request' }}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
