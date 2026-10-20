@@ -1,7 +1,7 @@
 ---
 services:
     iVentoy:
-        image: ghcr.io/goovoz/iventoy:1.0.45
+        image: ghcr.io/goovoz/iventoy:1.0.46
         container_name: iventoy
         restart: unless-stopped
         privileged: true

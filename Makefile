@@ -8,11 +8,11 @@ buildx:
 
 tag:
 	docker tag iventoy:build ghcr.io/goovoz/iventoy:latest
-	docker tag iventoy:build ghcr.io/goovoz/iventoy:1.0.45
+	docker tag iventoy:build ghcr.io/goovoz/iventoy:1.0.46
 
 push:
 	docker push ghcr.io/goovoz/iventoy:latest
-	docker push ghcr.io/goovoz/iventoy:1.0.45
+	docker push ghcr.io/goovoz/iventoy:1.0.46
 
 test:
 	sh tests/test-container-entrypoint.sh
