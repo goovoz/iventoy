@@ -1,0 +1,95 @@
+name: Cleanup Package Versions
+
+# 手动清理 ghcr 包内多余版本：保留 KEEP_TAGS 指向的 index 及其子 manifest（多架构平台
+# 镜像 + attestation），删除其余所有版本（含历史未打标签的残留与已废弃标签）。
+# 注意：多架构镜像的「untagged」子 manifest 是镜像本体，必须保留，删掉会导致镜像拉取失败。
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "true = 仅列出计划；false = 实际删除"
+        required: true
+        default: "true"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  clean:
+    runs-on: ubuntu-latest
+    env:
+      PKG: iventoy
+      KEEP_TAGS: "latest,1.0.45"
+      DRY_RUN: ${{ inputs.dry_run }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Build keep set (index + child manifests)
+        run: |
+          set -euo pipefail
+          OWNER="${{ github.repository_owner }}"
+          RESP=$(curl -s "https://ghcr.io/token?scope=repository:${OWNER}/${PKG}:pull&service=ghcr.io")
+          TOKEN=$(printf '%s' "$RESP" | jq -r .token)
+          ACCEPT="application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json"
+          : > /tmp/keep.txt
+          IFS=',' read -ra TAGS <<< "$KEEP_TAGS"
+          for raw in "${TAGS[@]}"; do
+            t=$(printf '%s' "$raw" | xargs)
+            [ -z "$t" ] && continue
+            IDX=$(curl -s -H "Authorization: Bearer $TOKEN" -H "Accept: $ACCEPT" \
+              "https://ghcr.io/v2/${OWNER}/${PKG}/manifests/${t}")
+            printf '%s' "$IDX" | jq -r '.manifests[]?.digest' >> /tmp/keep.txt || true
+            DG=$(curl -sI -H "Authorization: Bearer $TOKEN" -H "Accept: $ACCEPT" \
+              "https://ghcr.io/v2/${OWNER}/${PKG}/manifests/${t}" \
+              | grep -i '^docker-content-digest' | awk '{print $2}' | tr -d '\r')
+            [ -n "$DG" ] && echo "$DG" >> /tmp/keep.txt
+            echo "keep tag ${t} -> index ${DG:-<header 缺失>}"
+          done
+          sort -u /tmp/keep.txt -o /tmp/keep.txt
+          echo '--- 保留 digest ---'
+          cat /tmp/keep.txt
+
+      - name: Plan deletions
+        run: |
+          set -euo pipefail
+          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/user/packages/container/${PKG}/versions?per_page=100" > /tmp/versions.json
+          python3 - <<'PY' > /tmp/plan.txt
+          import json
+          keep = {x.strip() for x in open('/tmp/keep.txt') if x.strip()}
+          vs = json.load(open('/tmp/versions.json'))
+          for v in vs:
+              tags = (v.get('metadata') or {}).get('container', {}).get('tags') or []
+              action = 'KEEP' if v['name'] in keep else 'DELETE'
+              print(f"{action}\t{v['id']}\t{v['name']}\t{','.join(tags)}")
+          PY
+          echo '--- 计划 ---'
+          column -t -s $'\t' /tmp/plan.txt || cat /tmp/plan.txt
+          {
+            echo '### 包版本清理计划'
+            echo ''
+            echo '| 动作 | digest | 标签 |'
+            echo '|---|---|---|'
+            awk -F'\t' '{printf "| %s | %s | %s |\n", $1, substr($3,1,19), $4}' /tmp/plan.txt
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Delete outdated versions
+        run: |
+          set -euo pipefail
+          if [ "$DRY_RUN" = "true" ]; then
+            echo 'DRY RUN：未执行删除（用 dry_run=false 重跑以实际删除）'
+            exit 0
+          fi
+          fail=0
+          while IFS=$'\t' read -r action id name tags; do
+            [ "$action" = "DELETE" ] || continue
+            echo "删除 ${id} ${name} [${tags}]"
+            code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
+              -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/user/packages/container/${PKG}/versions/${id}")
+            echo "  HTTP ${code}"
+            [ "$code" = "204" ] || fail=1
+          done < /tmp/plan.txt
+          [ $fail -eq 0 ] || { echo '存在删除失败项'; exit 1; }
+          echo '清理完成'

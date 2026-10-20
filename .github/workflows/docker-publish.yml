@@ -83,13 +83,10 @@ jobs:
         with:
           images: ${{ steps.targets.outputs.images }}
           tags: |
-            # [iventoy-fork L1] is_default_branch 对 tag ref 恒为 false，原配置导致 :latest 永不刷新；
-            # 改为所有非 PR 构建都更新 latest。
+            # [iventoy-fork L1] 标签策略：只保留 latest + 精确版本号（1.0.45 这类），
+            # 不再产出 major/minor/branch 浮动标签，保持包内标签干净。详见 docs/UPSTREAM-SYNC.md。
             type=raw,value=latest,enable=${{ github.event_name != 'pull_request' }}
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=ref,event=branch
 
       - name: Build and push
         uses: docker/build-push-action@v5
