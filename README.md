@@ -9,6 +9,8 @@ The image is based on Debian 12 Bookworm slim. iVentoy runs in foreground mode s
 Docker Tag:
 * latest / 1.0.45: iVentoy v1.0.45
 
+Images are published to GitHub Container Registry: `ghcr.io/goovoz/iventoy`
+
 ## Usage
 
 It uses sysvfs so the container needs to be ran in privileged mode (not ideal!) and also needs port 69 which is in a privileged range.
@@ -37,7 +39,7 @@ Port 10809 is Linux Network Block Device - I'm not quite sure what iVentoy uses 
 There are a couple of volumes you can mount, the primary is the `iso` folder, which surprisingly containts your iso images you want to boot.
 
 ```
-docker run -d --privileged -p 69:69 -p 26000:26000 -p 16000:16000 -p 10809:10809 -v /path/to/iso:/iventoy/iso garybowers/iventoy:latest
+docker run -d --privileged -p 69:69 -p 26000:26000 -p 16000:16000 -p 10809:10809 -v /path/to/iso:/iventoy/iso ghcr.io/goovoz/iventoy:latest
 ```
 
 ### Persisting Configuration
@@ -45,7 +47,7 @@ docker run -d --privileged -p 69:69 -p 26000:26000 -p 16000:16000 -p 10809:10809
 Following the official upgrade rules, the container refreshes the version-specific `iventoy.dat` and `mac.db` files from the image on every start. Only the generated `config.dat` settings and mounted ISO files are carried across releases. You can therefore mount the persistent data directory on the first run:
 
 ```
-docker run -d --privileged -p 69:69 -p 26000:26000 -p 16000:16000 -p 10809:10809 -v /path/to/isos:/iventoy/iso -v /path/to/data:/iventoy/data --name iventoy garybowers/iventoy:latest
+docker run -d --privileged -p 69:69 -p 26000:26000 -p 16000:16000 -p 10809:10809 -v /path/to/isos:/iventoy/iso -v /path/to/data:/iventoy/data --name iventoy ghcr.io/goovoz/iventoy:latest
 ```
 
 Automatic PXE startup is disabled by default so the admin service remains available when the recovered Server IP is missing or no longer exists on the host. Configure a valid Server IP in the web UI first. To opt in afterward, set `IVENTOY_AUTO_RUN=1`; other values, including `0`, keep automatic startup disabled.
@@ -53,7 +55,7 @@ Automatic PXE startup is disabled by default so the admin service remains availa
 Alternatively run on host mode to serve PXE to docker host's LAN:
 
 ```
-docker run -d --privileged --net=host -v /path/to/isos:/iventoy/iso -v /path/to/data:/iventoy/data --name iventoy garybowers/iventoy:latest
+docker run -d --privileged --net=host -v /path/to/isos:/iventoy/iso -v /path/to/data:/iventoy/data --name iventoy ghcr.io/goovoz/iventoy:latest
 ```
 
 ### Configure your DHCP server

@@ -1,11 +1,7 @@
 ---
 services:
     iVentoy:
-        build:
-            context: .
-            args:
-                IVENTOY_VERSION: "1.0.45"
-        image: czyt/iventoy:latest
+        image: ghcr.io/goovoz/iventoy:1.0.45
         container_name: iventoy
         restart: unless-stopped
         privileged: true
