@@ -97,6 +97,10 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # [iventoy-fork L1] 关闭 provenance/SBOM attestation：它们会在镜像 index 里
+          # 额外产生 unknown/unknown 平台条目，污染平台清单。代价是失去 SLSA 证明。
+          provenance: false
+          sbom: false
           build-args: |
             IVENTOY_VERSION=${{ steps.version.outputs.iventoy_version }}
           cache-from: type=gha
