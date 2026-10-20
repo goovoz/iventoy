@@ -29,6 +29,13 @@ fi
 
 cd "${iventoy_dir}"
 if [ "$#" -eq 0 ]; then
+    # [iventoy-fork] 自检：二进制与 lib/lin64 捆绑库必须全部可解析。
+    # 上游某版本若不再捆绑某个 .so，这里快速失败并列出缺失项，而不是静默起不来。
+    if ldd "${iventoy_dir}/lib/iventoy" 2>/dev/null | grep -q 'not found'; then
+        echo "[ERROR] iVentoy 缺少共享库依赖，容器无法启动:" >&2
+        ldd "${iventoy_dir}/lib/iventoy" 2>&1 | grep 'not found' >&2
+        exit 1
+    fi
     set -- "${iventoy_dir}/lib/iventoy"
 fi
 exec "$@"

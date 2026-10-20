@@ -6,7 +6,10 @@
 docs/UPSTREAM-SYNC.md
 
 # L1 对上游文件的最小改动（均带 [iventoy-fork] 锚点注释，只增不改语义）：
-#   .github/workflows/docker-publish.yml
+#   .github/workflows/docker-publish.yml  —— 发布链路修正（secrets 容错、版本来源、latest 刷新）
+#   Dockerfile                            —— 多阶段重构（builder=alpine 仅下载解压，final=bookworm-slim 零 apt 包）
+#   files/docker-entrypoint.sh            —— 启动前 ldd 自检，缺库快速失败
 #
-# 以下文件的版本字符串由 track-iventoy-release.yml 自动维护，请勿手动长期偏离：
-#   Dockerfile / Makefile / docker-compose.yml / README.md
+# 版本字符串由 track-iventoy-release.yml 自动维护，勿手动长期偏离：
+#   Dockerfile（ENV 默认值）/ Makefile（镜像 tag）/ docker-compose.yml（image tag）/ README.md（版本表）
+# 镜像路径统一指向 ghcr.io/goovoz/iventoy（Makefile / docker-compose.yml / README.md）。

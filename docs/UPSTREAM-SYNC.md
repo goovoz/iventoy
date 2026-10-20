@@ -42,6 +42,24 @@ iVentoy 官方发布源：[ventoy/PXE releases](https://github.com/ventoy/PXE/re
   secrets 时同时发布到 Docker Hub（fork 不继承上游 secrets，未配置时自动跳过 Docker Hub）
 - 标签策略：每次非 PR 构建刷新 `latest`，tag 构建额外打 `<major>.<minor>.<patch>` 等语义化标签
 
+## 底包选型（为什么 final 必须是 debian:bookworm-slim）
+
+iVentoy 官方预编译二进制与 `lib/lin64/` 下的捆绑库全部是 glibc 链接（实证：`ldd` 只依赖
+`libc.so.6` / `libpthread.so.0` / `libdl.so.2`，其余全部解析到捆绑库）。Alpine 使用 musl libc，
+没有 glibc，二进制加载即失败——**final 镜像没有选择，必须 glibc 系，不能用 Alpine 瘦身**。
+
+当前结构：
+
+| 阶段 | 底包 | 职责 |
+|---|---|---|
+| builder | `alpine:3.20`（3.5MB） | 仅用 busybox wget/tar 下载解压，不执行二进制 |
+| final | `debian:bookworm-slim`（26.9MB） | 只承载 `/iventoy` 运行时，零 apt 包 |
+
+- debian 优于 ubuntu：更小、包更少、支持期更长（Debian 12 到 2028+，Ubuntu 22.04 标准支持 2027-04 截止）
+- builder 用官方 alpine，不用任何个人 convenience 镜像（供应链最小化）
+- 镜像内刻意不装 curl/wget：健康检查用 `/proc/net/tcp{,6}` 探测 26000（0x6590）的 LISTEN 状态，零额外依赖
+- entrypoint 启动前做 `ldd` 自检：上游某版若不再捆绑某个 .so，容器快速失败并列出缺失项
+
 ## 手动同步 dockers-x（GitHub parent）
 
 parent 若恢复更新，可手动把它的提交合进来：

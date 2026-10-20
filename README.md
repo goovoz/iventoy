@@ -11,6 +11,8 @@ Docker Tag:
 
 Images are published to GitHub Container Registry: `ghcr.io/goovoz/iventoy`
 
+The final image is based on `debian:bookworm-slim` — a hard requirement, not a preference: iVentoy ships prebuilt binaries with glibc-linked libraries bundled in `lib/lin64/`, which cannot load under Alpine musl libc. The multi-stage build does download/extract in an Alpine builder stage, so the runtime image carries no build tooling or extra packages. See [docs/UPSTREAM-SYNC.md](docs/UPSTREAM-SYNC.md) for the base-image rationale.
+
 ## Usage
 
 It uses sysvfs so the container needs to be ran in privileged mode (not ideal!) and also needs port 69 which is in a privileged range.
