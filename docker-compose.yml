@@ -19,13 +19,19 @@ services:
             - /data/iventoy/iso:/iventoy/iso
             - /data/iventoy/driver:/iventoy/driver
             - /data/iventoy/user:/iventoy/user
+        # 端口默认值取自 iVentoy 1.0.46 内置 Web UI（get_config_all）。
+        # 除 26000 外的 TCP 端口都能在 Configuration 页改，改了这里也要跟着改。
         ports:
-            - 26000:26000 # Web UI
-            - 16000:16000 # PXE 文件服务（HTTP）
+            - 26000:26000 # Web UI（固定，不可配置）
+            - 16000:16000 # HTTP 文件服务（bootfile / ISO 下载）
             - 10809:10809 # NBD
-            - 3260:3260 # iSCSI（Windows 安装/驱动注入会用到）
+            - 3260:3260 # iSCSI
             - 10445:10445 # SMB
             - 12049:12049 # NFS
             - 69:69/udp # TFTP
-        # 内置 DHCP（67/udp）在 bridge 网络下收不到广播，需要改 network_mode: host 且注释掉上面所有 ports：
+        # 下面两个 UDP 端口只有让 iVentoy 自己跑 DHCP 时才需要，且依赖二层广播：
+        #   67/udp    内置 DHCP（ProxyNet / External 模式）
+        #   4011/udp  proxyDHCP（Proxy / ProxyNet 模式）
+        # bridge 网络收不到广播，要启用就把下面这段的注释换上来，并注释掉上面所有 ports：
         #   network_mode: host
+        #   然后不再需要 ports 映射（host 模式直接用宿主机端口）

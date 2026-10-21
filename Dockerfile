@@ -41,5 +41,14 @@ RUN ln -sf /proc/1/fd/1 /iventoy/log/log.txt
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | grep -qE ':6590 [0-9A-F:]+ 0A'
 
-EXPOSE 26000 16000 10809 69/udp
+# [iventoy-fork] EXPOSE 只是文档性质（不影响实际监听），但与 iVentoy 真实端口保持一致：
+#   26000 Web UI（固定，WebUI 端口本身不可改）
+#   16000 HTTP 文件服务、10809 NBD、3260 iSCSI、10445 SMB、12049 NFS
+#         —— 后五项取自 1.0.46 内置 WebUI 的默认值（get_config_all → http_port/nbd_port/
+#            iscsi_port/smb_port/nfs_port），全部可在 Web UI 的 Configuration 页改
+#   UDP 69 TFTP；UDP 67 与 4011 只在 iVentoy 自己跑 DHCP 时才用
+#         （官方文档：ProxyNet 模式监听 UDP 67 + UDP 4011，Proxy 模式只监听 UDP 4011）
+#   注意：67/4011 依赖二层广播，bridge 网络下收不到，必须 network_mode: host
+EXPOSE 26000 16000 10809 3260 10445 12049
+EXPOSE 69/udp 67/udp 4011/udp
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint"]

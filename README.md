@@ -29,16 +29,21 @@ The default web admin endpoint port is 26000 and can be hit using a browser poin
 
 The default internal iVentoy webserver for serving images is 16000 this is configurable in the admin interface documented here [https://iventoy.com/en/doc_http_url.html](https://iventoy.com/en/doc_http_url.html), if changing ensure you forward the correct port number
 
-Port 10809 is Linux Network Block Device - I'm not quite sure what iVentoy uses it for, I'm going to assume to mount EFI or ISO's.
+Port 10809 is the NBD (Network Block Device) server iVentoy uses to hand block devices to the booting client.
 
-  - 69/69 UDP = TFTP Port
-  - 26000/26000 TCP = iVentoy Web GUI Interface
-  - 16000/16000 TCP = iVentoy iso & file server
-  - 10809/10809 TCP = Block Device
-  - 3260/3260 TCP = iSCSI (used by Windows installs / driver injection)
-  - 10445/10445 TCP = SMB
-  - 12049/12049 TCP = NFS
-  - 67/67 UDP = built-in DHCP server (only reachable with `network_mode: host`; bridge networking cannot receive DHCP broadcasts)
+The complete port list, with the defaults iVentoy 1.0.46 itself reports (`get_config_all` on the built-in web API). Everything except 26000 is configurable on the **Configuration** page — if you change one, update the port mapping too.
+
+  - 26000/26000 TCP = iVentoy Web GUI (fixed, not configurable)
+  - 16000/16000 TCP = iVentoy ISO & file server (`http_port`)
+  - 10809/10809 TCP = NBD block device (`nbd_port`)
+  - 3260/3260 TCP = iSCSI (`iscsi_port`)
+  - 10445/10445 TCP = SMB (`smb_port`)
+  - 12049/12049 TCP = NFS (`nfs_port`)
+  - 69/69 UDP = TFTP
+  - 67/67 UDP = built-in DHCP server (ProxyNet / External mode)
+  - 4011/4011 UDP = proxyDHCP (Proxy / ProxyNet mode)
+
+67 and 4011 rely on layer-2 broadcast, so they only work with `network_mode: host` — bridge networking cannot deliver DHCP broadcasts to the container. Every other port works fine with plain port mapping.
 
 ## Volumes
 
