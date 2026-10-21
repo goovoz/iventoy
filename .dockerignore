@@ -1,0 +1,10 @@
+# 构建上下文瘦身：镜像构建只需 Dockerfile + files/，其余全部排除
+.git
+.github
+docs
+tests
+*.tar.gz
+*.zip
+Makefile
+docker-compose.yml
+README.md

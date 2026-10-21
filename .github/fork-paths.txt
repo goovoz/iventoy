@@ -5,6 +5,7 @@
 .github/workflows/cleanup-package.yml
 .github/fork-paths.txt
 docs/UPSTREAM-SYNC.md
+.dockerignore
 
 # L1 对上游文件的最小改动（均带 [iventoy-fork] 锚点注释，只增不改语义）：
 #   .github/workflows/docker-publish.yml  —— 发布链路修正（secrets 容错、版本来源、latest 刷新）

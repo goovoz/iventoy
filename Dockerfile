@@ -13,12 +13,16 @@ RUN case "${TARGETARCH}" in \
       *) echo "Unsupported architecture: ${TARGETARCH}"; exit 1 ;; \
     esac && \
     wget -q "https://github.com/ventoy/PXE/releases/download/v${IVENTOY_VERSION}/iventoy-${IVENTOY_VERSION}-linux-${ARCH_SUFFIX}-${EDITION}.tar.gz" -O /tmp/iventoy.tar.gz && \
-    tar -xzf /tmp/iventoy.tar.gz -C /tmp && \
-    mv "/tmp/iventoy-${IVENTOY_VERSION}" /iventoy && \
+    mkdir -p /tmp/unpack && \
+    tar -xzf /tmp/iventoy.tar.gz -C /tmp/unpack && \
+    rm -f /tmp/iventoy.tar.gz && \
+    SRC=""; for d in /tmp/unpack/*/; do [ -d "$d" ] && { SRC="${d%/}"; break; }; done; \
+    [ -n "$SRC" ] || SRC=/tmp/unpack; \
+    mv "$SRC" /iventoy || exit 1; \
+    test -f /iventoy/lib/iventoy || { echo "ERROR: 解包后未找到 /iventoy/lib/iventoy，上游包结构可能又变了"; ls -la /iventoy; exit 1; }; \
     chmod +x /iventoy/lib/iventoy && \
     mkdir -p /usr/share/iventoy/data && \
-    cp /iventoy/data/iventoy.dat /iventoy/data/mac.db /usr/share/iventoy/data/ && \
-    rm -f /tmp/iventoy.tar.gz
+    cp /iventoy/data/iventoy.dat /iventoy/data/mac.db /usr/share/iventoy/data/
 
 FROM debian:bookworm-slim
 

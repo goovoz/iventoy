@@ -155,6 +155,42 @@ jobs:
             exit 1
           fi
           echo "已确认 ${TAG} 的构建记录存在（${COUNT} 条），镜像将自动更新"
+          RUN_ID=$(printf '%s' "$RUNS" | jq -r --arg tag "$TAG" '[.workflow_runs[] | select(.head_branch == $tag)] | max_by(.id) | .id')
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 等待镜像构建完成
+        id: wait_build
+        if: steps.latest.outputs.version != steps.current.outputs.version
+        run: |
+          set -uo pipefail
+          RUN_ID="${{ steps.dispatch.outputs.run_id }}"
+          if [[ -z "${RUN_ID}" ]]; then
+            echo "::error::未获取到构建 run id，无法确认镜像是否发布"
+            exit 1
+          fi
+          echo "跟踪构建 run: $RUN_ID"
+          for i in $(seq 1 60); do
+            sleep 20
+            J=$(curl -fsSL \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "$GITHUB_API_URL/repos/${{ github.repository }}/actions/runs/${RUN_ID}")
+            ST=$(printf '%s' "$J" | jq -r '.status')
+            CO=$(printf '%s' "$J" | jq -r '.conclusion // ""')
+            echo "[${i}/60] status=${ST} conclusion=${CO}"
+            if [[ "$ST" == "completed" ]]; then
+              if [[ "$CO" == "success" ]]; then
+                echo "镜像构建发布成功"
+                exit 0
+              fi
+              echo "::error::镜像构建失败（conclusion=${CO}），ghcr 镜像未更新：${{ github.server_url }}/${{ github.repository }}/actions/runs/${RUN_ID}"
+              exit 1
+            fi
+          done
+          echo "::error::等待镜像构建超时（20 分钟），请查看 ${{ github.server_url }}/${{ github.repository }}/actions/runs/${RUN_ID}"
+          exit 1
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -164,6 +200,7 @@ jobs:
           OLD="${{ steps.current.outputs.version }}"
           NEW="${{ steps.latest.outputs.version }}"
           DISPATCH="${{ steps.dispatch.outcome }}"
+          BUILD="${{ steps.wait_build.outcome }}"
           {
             echo "### iVentoy 上游版本跟踪"
             echo ""
@@ -173,12 +210,14 @@ jobs:
             echo "| 仓库更新前 | ${OLD:-<读取失败>} |"
             if [[ -n "$NEW" && "$NEW" != "$OLD" ]]; then
               echo "| 代码与标签 | 已更新版本引用并创建 refs/tags/v${NEW} |"
-              if [[ "$DISPATCH" == "success" ]]; then
-                echo "| 镜像构建 | 已派发 docker-publish.yml 并确认运行记录 |"
-              elif [[ "$DISPATCH" == "skipped" ]]; then
-                echo "| 镜像构建 | 未执行（版本未变更） |"
-              else
+              if [[ "$DISPATCH" != "success" ]]; then
                 echo "| 镜像构建 | **派发失败（${DISPATCH:-unknown}），ghcr 镜像不会更新，需人工处理** |"
+              elif [[ "$BUILD" == "success" ]]; then
+                echo "| 镜像构建 | 已成功发布（ghcr 标签：latest + ${NEW}） |"
+              elif [[ "$BUILD" == "failure" ]]; then
+                echo "| 镜像构建 | **构建失败，ghcr 镜像仍为旧版，需人工处理** |"
+              else
+                echo "| 镜像构建 | 派发成功但未确认结果（${BUILD:-unknown}） |"
               fi
             else
               echo "| 操作 | 已是最新，无需更新 |"

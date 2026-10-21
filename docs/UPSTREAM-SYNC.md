@@ -32,7 +32,11 @@ iVentoy 官方发布源：[ventoy/PXE releases](https://github.com/ventoy/PXE/re
    - 若替换后 `git diff` 为空则报错终止（防止引用模式悄悄失效）
    - 提交推送到 `main`，创建 `v<X.Y.Z>` 标签（已存在则跳过）
    - 通过 `workflow_dispatch` 派发 `docker-publish.yml` 构建多架构镜像并发布
-     （`workflow_dispatch` 是 GITHUB_TOKEN 触发级联的法定例外，能正常创建新 run）
+     （`workflow_dispatch` 是 GITHUB_TOKEN 触发级联的法定例外，能正常创建新 run，
+     但令牌必须同时具备 `actions: write`，否则接口返回 403）
+   - **等构建跑完并校验结论**：轮询该 run 最多 20 分钟，只有 `conclusion == success`
+     才算跟踪成功；构建失败会让 tracker 直接变红并给出 run 链接，避免
+     「代码更新了但镜像没更新」却不报警（2026-10-21 的 1.0.46 故障就是这种静默失败）
 
 ## 镜像发布链路（docker-publish.yml）
 
@@ -88,4 +92,14 @@ git merge upstream/main
 | tracker 报错「无法从上游解析出版本号」 | 上游 tag 命名变更 | 人工确认新版命名，调整 tracker |
 | tracker 报错「缺少构建所需资产」 | 上游资产命名变更 | 人工确认后调整 Dockerfile 的下载 URL 模式与 tracker 校验列表 |
 | tracker 报错「没有任何文件被改动」 | 版本引用模式失效 | 检查四个文件的版本字符串形态是否被重构 |
+| tracker 报 403（覆盖范围：派发失败） | `permissions` 缺少 `actions: write` | 已在 2026-10-21 修复；若再出现，检查 workflow 顶部 permissions |
+| 镜像构建失败，日志停在 `wget`/`mv` 步骤 | 上游改了包内顶层目录名或资产命名 | Dockerfile 已改为自动探测顶层目录；若仍失败，看构建日志里 `ls -la /iventoy` 输出确认新结构 |
 | 镜像构建失败 | 上游新版本的运行依赖变化 | 看 docker-publish 日志，修 Dockerfile 后手动派发重建 |
+
+## 上游包结构变更记录
+
+- `<= 1.0.45`：tarball 顶层目录为 `iventoy-<版本>/`（如 `iventoy-1.0.45/`）
+- `>= 1.0.46`：顶层目录改为固定的 `iventoy/`；`lib/iventoy` 与 `lib/lin64/*.so` 布局未变
+
+Dockerfile 已按「解包到临时目录 → 探测唯一顶层目录 → mv 成 /iventoy」处理，
+不依赖具体目录名；并校验 `lib/iventoy` 存在，缺失时立即报错并打印目录清单。
