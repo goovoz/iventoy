@@ -91,10 +91,10 @@ jobs:
           set -euo pipefail
           OLD="${{ steps.current.outputs.version }}"
           NEW="${{ steps.latest.outputs.version }}"
-          # [iventoy-fork] 以下四处版本引用由本 workflow 自动维护，改动模式前先读 docs/UPSTREAM-SYNC.md
+          # [iventoy-fork] 以下三处版本引用由本 workflow 自动维护，改动模式前先读 docs/UPSTREAM-SYNC.md
+          # docker-compose.yml 已改用 :latest，不再含版本号，故无需替换。
           sed -i "s|\${IVENTOY_VERSION:-${OLD}}|\${IVENTOY_VERSION:-${NEW}}|" Dockerfile
           sed -i "s|iventoy:${OLD}|iventoy:${NEW}|g" Makefile
-          sed -i "s|iventoy:${OLD}|iventoy:${NEW}|" docker-compose.yml
           sed -i "s|/ ${OLD}: iVentoy v${OLD}|/ ${NEW}: iVentoy v${NEW}|" README.md
           if git diff --quiet; then
             echo "::error::版本 ${OLD} -> ${NEW}，但没有任何文件被改动，疑似引用模式失效，终止推送"

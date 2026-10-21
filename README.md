@@ -35,13 +35,17 @@ Port 10809 is Linux Network Block Device - I'm not quite sure what iVentoy uses 
   - 26000/26000 TCP = iVentoy Web GUI Interface
   - 16000/16000 TCP = iVentoy iso & file server
   - 10809/10809 TCP = Block Device
+  - 3260/3260 TCP = iSCSI (used by Windows installs / driver injection)
+  - 10445/10445 TCP = SMB
+  - 12049/12049 TCP = NFS
+  - 67/67 UDP = built-in DHCP server (only reachable with `network_mode: host`; bridge networking cannot receive DHCP broadcasts)
 
 ## Volumes
 
 There are a couple of volumes you can mount, the primary is the `iso` folder, which surprisingly containts your iso images you want to boot.
 
 ```
-docker run -d --privileged -p 69:69 -p 26000:26000 -p 16000:16000 -p 10809:10809 -v /path/to/iso:/iventoy/iso ghcr.io/goovoz/iventoy:latest
+docker run -d --privileged -p 69:69/udp -p 26000:26000 -p 16000:16000 -p 10809:10809 -p 3260:3260 -p 10445:10445 -p 12049:12049 -v /path/to/iso:/iventoy/iso ghcr.io/goovoz/iventoy:latest
 ```
 
 ### Persisting Configuration
@@ -49,7 +53,7 @@ docker run -d --privileged -p 69:69 -p 26000:26000 -p 16000:16000 -p 10809:10809
 Following the official upgrade rules, the container refreshes the version-specific `iventoy.dat` and `mac.db` files from the image on every start. Only the generated `config.dat` settings and mounted ISO files are carried across releases. You can therefore mount the persistent data directory on the first run:
 
 ```
-docker run -d --privileged -p 69:69 -p 26000:26000 -p 16000:16000 -p 10809:10809 -v /path/to/isos:/iventoy/iso -v /path/to/data:/iventoy/data --name iventoy ghcr.io/goovoz/iventoy:latest
+docker run -d --privileged -p 69:69/udp -p 26000:26000 -p 16000:16000 -p 10809:10809 -p 3260:3260 -p 10445:10445 -p 12049:12049 -v /path/to/isos:/iventoy/iso -v /path/to/data:/iventoy/data --name iventoy ghcr.io/goovoz/iventoy:latest
 ```
 
 Automatic PXE startup is disabled by default so the admin service remains available when the recovered Server IP is missing or no longer exists on the host. Configure a valid Server IP in the web UI first. To opt in afterward, set `IVENTOY_AUTO_RUN=1`; other values, including `0`, keep automatic startup disabled.
@@ -58,6 +62,25 @@ Alternatively run on host mode to serve PXE to docker host's LAN:
 
 ```
 docker run -d --privileged --net=host -v /path/to/isos:/iventoy/iso -v /path/to/data:/iventoy/data --name iventoy ghcr.io/goovoz/iventoy:latest
+```
+
+### Other mountable directories
+
+Besides `data` and `iso`, these directories can be mounted when you use the matching iVentoy features:
+
+| Host path | Container path | Contents |
+|---|---|---|
+| `/path/to/driver` | `/iventoy/driver` | Driver ISO used by the *driver mode* / Windows driver injection |
+| `/path/to/user` | `/iventoy/user` | Your own files: auto-install scripts, third-party tools |
+
+Do **not** mount `/iventoy/log`: the image symlinks `log/log.txt` to the container's stdout, which is what makes `docker logs` (and your container manager) show the iVentoy log. Mounting a host directory over it hides the symlink and the log silently goes to the file only.
+
+### Docker Compose
+
+A ready-to-use [docker-compose.yml](docker-compose.yml) is included (image pinned to `:latest`, all ports, `data` / `iso` / `driver` / `user` volumes, `TZ`). Adjust the host paths and run:
+
+```
+docker compose up -d
 ```
 
 ### Configure your DHCP server
@@ -90,7 +113,7 @@ Once your container is up and running go to the IP address of your server on por
 This fork follows the official iVentoy releases from [ventoy/PXE](https://github.com/ventoy/PXE/releases) automatically:
 
 - A scheduled GitHub Actions workflow (`.github/workflows/track-iventoy-release.yml`) checks the upstream release feed every day.
-- When a new stable version appears, it bumps the version references in `Dockerfile`, `Makefile`, `docker-compose.yml` and `README.md`, pushes the commit to `main`, creates a `vX.Y.Z` tag, and triggers the multi-arch image build.
+- When a new stable version appears, it bumps the version references in `Dockerfile`, `Makefile` and `README.md`, pushes the commit to `main`, creates a `vX.Y.Z` tag, triggers the multi-arch image build, and only reports success once the image is actually published. (`docker-compose.yml` always uses `:latest`, so it carries no version.)
 - If the upstream version matches the version in this repository, nothing is pushed.
 
 You can also run it manually: **Actions → "Track iVentoy Upstream Release" → Run workflow** (optionally pinning an explicit version). See [docs/UPSTREAM-SYNC.md](docs/UPSTREAM-SYNC.md) for the full mechanism.

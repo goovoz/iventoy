@@ -1,16 +1,31 @@
 ---
+# 镜像统一走 ghcr.io/goovoz/iventoy:latest（跟随本仓库自动发布的最新版本）。
+# 需要钉版本时把 :latest 换成 :1.0.46 之类的精确 tag（每个版本都同时发布 latest 与 X.Y.Z）。
 services:
-    iVentoy:
-        image: ghcr.io/goovoz/iventoy:1.0.46
+    iventoy:
+        image: ghcr.io/goovoz/iventoy:latest
         container_name: iventoy
-        restart: unless-stopped
-        privileged: true
         hostname: iventoy
+        restart: unless-stopped
+        # iVentoy 需要操作网络接口与挂载，必须 privileged
+        privileged: true
+        environment:
+            TZ: Asia/Shanghai
+            # 自动启动默认关闭：先在 Web UI 里确认 Server IP、并把 DHCP 模式设成 External，
+            # 之后再改成 "1" 让它随容器自动启动 PXE 服务。
+            IVENTOY_AUTO_RUN: "0"
         volumes:
             - /data/iventoy/data:/iventoy/data
             - /data/iventoy/iso:/iventoy/iso
+            - /data/iventoy/driver:/iventoy/driver
+            - /data/iventoy/user:/iventoy/user
         ports:
-            - 26000:26000
-            - 16000:16000
-            - 10809:10809
-            - 69:69/udp
+            - 26000:26000 # Web UI
+            - 16000:16000 # PXE 文件服务（HTTP）
+            - 10809:10809 # NBD
+            - 3260:3260 # iSCSI（Windows 安装/驱动注入会用到）
+            - 10445:10445 # SMB
+            - 12049:12049 # NFS
+            - 69:69/udp # TFTP
+        # 内置 DHCP（67/udp）在 bridge 网络下收不到广播，需要改 network_mode: host 且注释掉上面所有 ports：
+        #   network_mode: host

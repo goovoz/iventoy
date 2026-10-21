@@ -28,7 +28,8 @@ iVentoy 官方发布源：[ventoy/PXE releases](https://github.com/ventoy/PXE/re
    `iventoy-<V>-linux-x86_64-free.tar.gz` 与 `iventoy-<V>-linux-arm64-trial.tar.gz`，
    缺任何一个即报错终止（防止上游改名后推进坏版本）
 4. **更新并发布**（仅在上游有新版本时）：
-   - 用 sed 替换 `Dockerfile` / `Makefile` / `docker-compose.yml` / `README.md` 中的版本引用
+   - 用 sed 替换 `Dockerfile` / `Makefile` / `README.md` 中的版本引用
+     （`docker-compose.yml` 固定使用 `:latest`，不含版本号，无需替换）
    - 若替换后 `git diff` 为空则报错终止（防止引用模式悄悄失效）
    - 提交推送到 `main`，创建 `v<X.Y.Z>` 标签（已存在则跳过）
    - 通过 `workflow_dispatch` 派发 `docker-publish.yml` 构建多架构镜像并发布
@@ -91,7 +92,7 @@ git merge upstream/main
 | tracker 每天空跑 | 上游无新发布 | 正常，无需处理 |
 | tracker 报错「无法从上游解析出版本号」 | 上游 tag 命名变更 | 人工确认新版命名，调整 tracker |
 | tracker 报错「缺少构建所需资产」 | 上游资产命名变更 | 人工确认后调整 Dockerfile 的下载 URL 模式与 tracker 校验列表 |
-| tracker 报错「没有任何文件被改动」 | 版本引用模式失效 | 检查四个文件的版本字符串形态是否被重构 |
+| tracker 报错「没有任何文件被改动」 | 版本引用模式失效 | 检查 Dockerfile / Makefile / README 三处版本字符串形态是否被重构 |
 | tracker 报 403（覆盖范围：派发失败） | `permissions` 缺少 `actions: write` | 已在 2026-10-21 修复；若再出现，检查 workflow 顶部 permissions |
 | 镜像构建失败，日志停在 `wget`/`mv` 步骤 | 上游改了包内顶层目录名或资产命名 | Dockerfile 已改为自动探测顶层目录；若仍失败，看构建日志里 `ls -la /iventoy` 输出确认新结构 |
 | 镜像构建失败 | 上游新版本的运行依赖变化 | 看 docker-publish 日志，修 Dockerfile 后手动派发重建 |
