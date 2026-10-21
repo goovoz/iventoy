@@ -38,6 +38,12 @@ jobs:
           echo "dispatch HTTP = ${CODE}"
           echo "response body: $(cat /tmp/body 2>/dev/null)"
           echo "code=$CODE" >> "$GITHUB_OUTPUT"
+          if [[ "$CODE" != "204" ]]; then
+            echo "::error::派发失败（HTTP ${CODE}）"
+            exit 1
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: 确认构建 run 已创建
         run: |
