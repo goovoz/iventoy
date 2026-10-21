@@ -1,0 +1,57 @@
+name: Permission Self Test (temporary)
+
+# [临时文件] 仅用于验证 GITHUB_TOKEN 在 actions: write 权限下能否成功派发
+# docker-publish.yml（复现并确认 2026-10-21 的 403 故障已修复）。
+# 验证完成后本文件会被删除。
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "要派发的 docker-publish ref（tag 名，如 v1.0.46）"
+        required: false
+        default: "v1.0.46"
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  dispatch-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 打印令牌权限
+        run: |
+          echo "token permissions: contents=write actions=write（本 workflow 声明）"
+
+      - name: 派发 docker-publish 并打印 HTTP 码
+        id: d
+        run: |
+          set -uo pipefail
+          REF="${{ inputs.ref }}"
+          CODE=$(curl -sS -o /tmp/body -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "$GITHUB_API_URL/repos/${{ github.repository }}/actions/workflows/docker-publish.yml/dispatches" \
+            -d "{\"ref\":\"${REF}\"}") || CODE="000"
+          echo "dispatch HTTP = ${CODE}"
+          echo "response body: $(cat /tmp/body 2>/dev/null)"
+          echo "code=$CODE" >> "$GITHUB_OUTPUT"
+
+      - name: 确认构建 run 已创建
+        run: |
+          set -uo pipefail
+          REF="${{ inputs.ref }}"
+          sleep 12
+          RUNS=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "$GITHUB_API_URL/repos/${{ github.repository }}/actions/workflows/docker-publish.yml/runs?per_page=20")
+          printf '%s' "$RUNS" | jq -r --arg tag "$REF" '.workflow_runs[] | select(.head_branch == $tag) | "  run \(.id) | \(.status)/\(.conclusion) | \(.created_at)"'
+          COUNT=$(printf '%s' "$RUNS" | jq --arg tag "$REF" '[.workflow_runs[] | select(.head_branch == $tag)] | length')
+          echo "匹配 run 数量: ${COUNT}"
+          if [[ "${COUNT:-0}" -lt 1 ]]; then
+            echo "::error::派发后未查到该 ref 的构建记录"
+            exit 1
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -16,6 +16,10 @@ on:
 
 permissions:
   contents: write
+  # [iventoy-fork] 必须有 actions: write，否则 workflow_dispatch 会被 403 拒绝
+  # （2026-10-21 故障：仅写 contents: write 时，1.0.45->1.0.46 的自动更新推送/打标签成功，
+  #  但派发镜像构建 403 失败，导致 ghcr 镜像没有跟着更新）。
+  actions: write
 
 concurrency:
   group: track-iventoy-release
@@ -115,17 +119,42 @@ jobs:
           fi
 
       - name: 触发镜像构建发布
+        id: dispatch
         if: steps.latest.outputs.version != steps.current.outputs.version
         run: |
           set -euo pipefail
           TAG="v${{ steps.latest.outputs.version }}"
-          # workflow_dispatch 是 GITHUB_TOKEN 触发级联的法定例外，可正常创建新 run
-          curl -fsSL -X POST \
+          URL="$GITHUB_API_URL/repos/${{ github.repository }}/actions/workflows/docker-publish.yml/dispatches"
+          CODE=""
+          # workflow_dispatch 是 GITHUB_TOKEN 触发级联的法定例外，可正常创建新 run；
+          # 但令牌必须同时具备 actions: write（见文件顶部 permissions）。
+          for attempt in 1 2 3; do
+            CODE=$(curl -sS -o /tmp/dispatch.body -w '%{http_code}' -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "$URL" -d "{\"ref\":\"${TAG}\"}") || CODE="000"
+            if [[ "$CODE" == "204" ]]; then break; fi
+            echo "第 ${attempt} 次派发失败（HTTP ${CODE})：$(cat /tmp/dispatch.body 2>/dev/null)"
+            [[ "$attempt" -lt 3 ]] && sleep 10
+          done
+          if [[ "$CODE" != "204" ]]; then
+            echo "::error::派发镜像构建失败（HTTP ${CODE}）。403 通常表示 permissions 缺少 actions: write"
+            exit 1
+          fi
+          echo "已派发 docker-publish.yml @ ${TAG}（HTTP 204）"
+          # 二次确认：接口返回 204 不等于 run 真的建立了，必须查到运行记录才算成功
+          sleep 8
+          RUNS=$(curl -fsSL \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/docker-publish.yml/dispatches" \
-            -d "{\"ref\":\"refs/tags/${TAG}\"}"
-          echo "已派发 docker-publish.yml @ refs/tags/${TAG}"
+            "$GITHUB_API_URL/repos/${{ github.repository }}/actions/workflows/docker-publish.yml/runs?per_page=20")
+          COUNT=$(printf '%s' "$RUNS" | jq --arg tag "$TAG" '[.workflow_runs[] | select(.head_branch == $tag)] | length')
+          if [[ "${COUNT:-0}" -lt 1 ]]; then
+            echo "::error::派发返回 204，但未查到 ${TAG} 的构建记录，镜像不会更新，需人工检查"
+            exit 1
+          fi
+          echo "已确认 ${TAG} 的构建记录存在（${COUNT} 条），镜像将自动更新"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -134,6 +163,7 @@ jobs:
         run: |
           OLD="${{ steps.current.outputs.version }}"
           NEW="${{ steps.latest.outputs.version }}"
+          DISPATCH="${{ steps.dispatch.outcome }}"
           {
             echo "### iVentoy 上游版本跟踪"
             echo ""
@@ -142,7 +172,14 @@ jobs:
             echo "| 上游最新 | ${NEW:-<获取失败>} |"
             echo "| 仓库更新前 | ${OLD:-<读取失败>} |"
             if [[ -n "$NEW" && "$NEW" != "$OLD" ]]; then
-              echo "| 操作 | 已更新版本引用、创建标签 refs/tags/v${NEW} 并触发镜像构建 |"
+              echo "| 代码与标签 | 已更新版本引用并创建 refs/tags/v${NEW} |"
+              if [[ "$DISPATCH" == "success" ]]; then
+                echo "| 镜像构建 | 已派发 docker-publish.yml 并确认运行记录 |"
+              elif [[ "$DISPATCH" == "skipped" ]]; then
+                echo "| 镜像构建 | 未执行（版本未变更） |"
+              else
+                echo "| 镜像构建 | **派发失败（${DISPATCH:-unknown}），ghcr 镜像不会更新，需人工处理** |"
+              fi
             else
               echo "| 操作 | 已是最新，无需更新 |"
             fi
