@@ -7,7 +7,7 @@ The image is based on Debian 12 Bookworm slim. iVentoy runs in foreground mode s
 ## Versions
 
 Docker Tag:
-* latest / 1.0.46: iVentoy v1.0.46
+* latest / 1.0.47: iVentoy v1.0.47
 
 Images are published to GitHub Container Registry: `ghcr.io/goovoz/iventoy`
 

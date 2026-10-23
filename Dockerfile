@@ -4,7 +4,7 @@
 FROM alpine:3.20 AS init
 
 ARG IVENTOY_VERSION
-ENV IVENTOY_VERSION=${IVENTOY_VERSION:-1.0.46}
+ENV IVENTOY_VERSION=${IVENTOY_VERSION:-1.0.47}
 ARG TARGETARCH
 
 RUN case "${TARGETARCH}" in \
@@ -27,7 +27,7 @@ RUN case "${TARGETARCH}" in \
 FROM debian:bookworm-slim
 
 ARG IVENTOY_VERSION
-ENV IVENTOY_VERSION=${IVENTOY_VERSION:-1.0.46}
+ENV IVENTOY_VERSION=${IVENTOY_VERSION:-1.0.47}
 
 COPY --from=init /iventoy /iventoy
 COPY --from=init /usr/share/iventoy/data /usr/share/iventoy/data
