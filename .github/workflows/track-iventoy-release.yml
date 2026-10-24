@@ -2,7 +2,13 @@ name: Track iVentoy Upstream Release
 
 # 自动跟随 iVentoy 官方发布（https://github.com/ventoy/PXE/releases）。
 # 上游出现新的稳定版时：自动改版本引用 -> 提交推送 main -> 打 vX.Y.Z 标签 -> 触发镜像构建发布。
-# 上游无新版本时每天空跑退出，不做任何推送。机制详见 docs/UPSTREAM-SYNC.md。
+#
+# [iventoy-fork] 上游无新版本时**不再直接空跑**：会先对账 ghcr 上是否存在当前版本的镜像。
+# 若缺失（上一次构建失败 / 被清理 / 派发 403），会重新派发构建并在失败时变红。
+# 否则一旦「版本已 bump 但镜像没发出去」，第二天起 current == latest 就永远空跑，
+# 镜像会静默停在旧版本（2026-10-21 的 1.0.46 故障即此类）。
+#
+# 机制详见 docs/UPSTREAM-SYNC.md。
 
 on:
   schedule:
@@ -25,6 +31,10 @@ concurrency:
   group: track-iventoy-release
   cancel-in-progress: false
 
+env:
+  PACKAGE: iventoy
+  VERSION_PATTERN: 'IVENTOY_VERSION:-\K[0-9]+\.[0-9]+\.[0-9]+'
+
 jobs:
   track:
     runs-on: ubuntu-latest
@@ -36,43 +46,47 @@ jobs:
 
       - name: 获取上游最新版本
         id: latest
+        # 用户输入经 env 传入，不直接插值进 shell（否则 "1.0.48"; rm -rf / 这类输入会执行）
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          if [[ -n "${{ inputs.version }}" ]]; then
-            LATEST="${{ inputs.version }}"
+          if [[ -n "${INPUT_VERSION}" ]]; then
+            LATEST="${INPUT_VERSION}"
           else
-            LATEST=$(curl -fsSL \
-              -H "Authorization: Bearer $GH_TOKEN" \
+            LATEST=$(curl -fsSL --retry 3 --retry-delay 5 \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
               -H "Accept: application/vnd.github+json" \
               https://api.github.com/repos/ventoy/PXE/releases/latest \
-              | jq -r '.tag_name' | sed 's/^v//')
+              | jq -r '.tag_name' | sed 's/^[vV]//')
           fi
-          if [[ ! "$LATEST" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::无法从上游解析出版本号: '$LATEST'（tag 命名可能已变更，需人工处理）"
+          if [[ ! "${LATEST}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::无法从上游解析出版本号: '${LATEST}'（tag 命名可能已变更，需人工处理）"
             exit 1
           fi
-          echo "version=$LATEST" >> "$GITHUB_OUTPUT"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          echo "version=${LATEST}" >> "$GITHUB_OUTPUT"
 
       - name: 读取仓库当前版本
         id: current
         run: |
           set -euo pipefail
-          CURRENT=$(grep -oP 'IVENTOY_VERSION:-\K[0-9][0-9.]*' Dockerfile | head -1)
-          if [[ -z "$CURRENT" ]]; then
+          CURRENT=$(grep -oP "${VERSION_PATTERN}" Dockerfile | head -1 || true)
+          if [[ -z "${CURRENT}" ]]; then
             echo "::error::Dockerfile 中未找到 IVENTOY_VERSION 默认值"
             exit 1
           fi
-          echo "version=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "version=${CURRENT}" >> "$GITHUB_OUTPUT"
 
       - name: 校验上游发布资产齐全
         id: assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          V: ${{ steps.latest.outputs.version }}
         run: |
           set -euo pipefail
-          V="${{ steps.latest.outputs.version }}"
-          NAMES=$(curl -fsSL \
-            -H "Authorization: Bearer $GH_TOKEN" \
+          NAMES=$(curl -fsSL --retry 3 --retry-delay 5 \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/ventoy/PXE/releases/tags/v${V}" \
             | jq -r '.assets[].name')
@@ -82,55 +96,107 @@ jobs:
               exit 1
             fi
           done
+
+      # [iventoy-fork] 对账：仓库里的版本号必须真的对应一个已发布的镜像。
+      # 查询失败（401/5xx/网络）记为 unknown，本轮不据此判定，避免误触发构建风暴。
+      - name: 对账：当前版本镜像是否已发布
+        id: registry
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          VERSION: ${{ steps.current.outputs.version }}
+        run: |
+          set -uo pipefail
+          CODE=000
+          for attempt in 1 2 3; do
+            TOKEN=$(curl -sS --max-time 20 \
+              "https://ghcr.io/token?scope=repository:${OWNER}/${PACKAGE}:pull&service=ghcr.io" \
+              | jq -r '.token // empty') || TOKEN=""
+            if [[ -z "${TOKEN}" ]]; then
+              echo "第 ${attempt} 次获取 ghcr token 失败，重试"
+              sleep 5
+              continue
+            fi
+            CODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 \
+              -H "Authorization: Bearer ${TOKEN}" \
+              -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json" \
+              "https://ghcr.io/v2/${OWNER}/${PACKAGE}/manifests/${VERSION}") || CODE=000
+            if [[ "${CODE}" == "200" || "${CODE}" == "404" ]]; then
+              break
+            fi
+            echo "第 ${attempt} 次查询 ghcr 返回 HTTP ${CODE}，重试"
+            sleep 5
+          done
+          case "${CODE}" in
+            200)
+              echo "published=true" >> "$GITHUB_OUTPUT"
+              echo "ghcr 已存在 ${VERSION} 镜像"
+              ;;
+            404)
+              echo "published=false" >> "$GITHUB_OUTPUT"
+              echo "::warning::ghcr 缺少 ${VERSION} 镜像，本轮将重新派发构建"
+              ;;
+            *)
+              echo "published=unknown" >> "$GITHUB_OUTPUT"
+              echo "::warning::查询 ghcr 失败（HTTP ${CODE}），本轮不做镜像对账判定"
+              ;;
+          esac
 
       - name: 更新版本引用并推送
         if: steps.latest.outputs.version != steps.current.outputs.version
+        env:
+          OLD: ${{ steps.current.outputs.version }}
+          NEW: ${{ steps.latest.outputs.version }}
         run: |
           set -euo pipefail
-          OLD="${{ steps.current.outputs.version }}"
-          NEW="${{ steps.latest.outputs.version }}"
-          # [iventoy-fork] 以下三处版本引用由本 workflow 自动维护，改动模式前先读 docs/UPSTREAM-SYNC.md
-          # docker-compose.yml 已改用 :latest，不再含版本号，故无需替换。
-          sed -i "s|\${IVENTOY_VERSION:-${OLD}}|\${IVENTOY_VERSION:-${NEW}}|" Dockerfile
-          sed -i "s|iventoy:${OLD}|iventoy:${NEW}|g" Makefile
-          sed -i "s|/ ${OLD}: iVentoy v${OLD}|/ ${NEW}: iVentoy v${NEW}|" README.md
-          if git diff --quiet; then
-            echo "::error::版本 ${OLD} -> ${NEW}，但没有任何文件被改动，疑似引用模式失效，终止推送"
-            exit 1
-          fi
+          # [iventoy-fork] 版本引用由本 workflow 自动维护，改动模式前先读 docs/UPSTREAM-SYNC.md
+          # docker-compose.yml 用 :latest、Makefile 的 VERSION 从 Dockerfile 现读，均不含版本号，
+          # 所以只有下面两个文件需要替换。
+          sed -i "s|\${IVENTOY_VERSION:-${OLD}}|\${IVENTOY_VERSION:-${NEW}}|g" Dockerfile
+          sed -i "s|/ ${OLD}: iVentoy v${OLD}|/ ${NEW}: iVentoy v${NEW}|g" README.md
+          # 逐文件校验：任何一个文件没被改到，说明引用模式失效，立即失败而不是推一个半新半旧的状态
+          for f in Dockerfile README.md; do
+            if git diff --quiet -- "$f"; then
+              echo "::error::${OLD} -> ${NEW} 但 ${f} 没有任何改动，版本引用模式可能已失效"
+              exit 1
+            fi
+          done
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
+          git add Dockerfile README.md
           git commit -m "chore: auto-update iVentoy ${OLD} -> ${NEW}"
           git push origin HEAD:main
 
       - name: 创建版本标签
-        if: steps.latest.outputs.version != steps.current.outputs.version
+        id: tag
+        if: steps.latest.outputs.version != steps.current.outputs.version || steps.registry.outputs.published == 'false'
+        env:
+          V: ${{ steps.latest.outputs.version }}
         run: |
           set -euo pipefail
-          TAG="v${{ steps.latest.outputs.version }}"
+          TAG="v${V}"
           if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
             echo "标签 ${TAG} 已存在，跳过创建"
           else
             git tag "$TAG"
             git push origin "refs/tags/${TAG}"
           fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
 
       - name: 触发镜像构建发布
         id: dispatch
-        if: steps.latest.outputs.version != steps.current.outputs.version
+        if: steps.latest.outputs.version != steps.current.outputs.version || steps.registry.outputs.published == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
         run: |
           set -euo pipefail
-          TAG="v${{ steps.latest.outputs.version }}"
-          URL="$GITHUB_API_URL/repos/${{ github.repository }}/actions/workflows/docker-publish.yml/dispatches"
+          URL="${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/docker-publish.yml/dispatches"
           CODE=""
           # workflow_dispatch 是 GITHUB_TOKEN 触发级联的法定例外，可正常创建新 run；
           # 但令牌必须同时具备 actions: write（见文件顶部 permissions）。
           for attempt in 1 2 3; do
             CODE=$(curl -sS -o /tmp/dispatch.body -w '%{http_code}' -X POST \
-              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
               -H "Accept: application/vnd.github+json" \
               -H "X-GitHub-Api-Version: 2022-11-28" \
               "$URL" -d "{\"ref\":\"${TAG}\"}") || CODE="000"
@@ -144,80 +210,98 @@ jobs:
           fi
           echo "已派发 docker-publish.yml @ ${TAG}（HTTP 204）"
           # 二次确认：接口返回 204 不等于 run 真的建立了，必须查到运行记录才算成功
-          sleep 8
-          RUNS=$(curl -fsSL \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "$GITHUB_API_URL/repos/${{ github.repository }}/actions/workflows/docker-publish.yml/runs?per_page=20")
-          COUNT=$(printf '%s' "$RUNS" | jq --arg tag "$TAG" '[.workflow_runs[] | select(.head_branch == $tag)] | length')
-          if [[ "${COUNT:-0}" -lt 1 ]]; then
+          RUN_ID=""
+          for attempt in 1 2 3 4 5 6; do
+            sleep 8
+            RUNS=$(curl -sS --retry 3 --retry-delay 5 -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/docker-publish.yml/runs?per_page=20" || true)
+            RUN_ID=$(printf '%s' "${RUNS}" | jq -r --arg tag "$TAG" \
+              '[.workflow_runs[]? | select(.head_branch == $tag)] | max_by(.id) | .id // empty')
+            [[ -n "${RUN_ID}" ]] && break
+            echo "第 ${attempt} 次查询未看到 ${TAG} 的构建记录，继续等待"
+          done
+          if [[ -z "${RUN_ID}" ]]; then
             echo "::error::派发返回 204，但未查到 ${TAG} 的构建记录，镜像不会更新，需人工检查"
             exit 1
           fi
-          echo "已确认 ${TAG} 的构建记录存在（${COUNT} 条），镜像将自动更新"
-          RUN_ID=$(printf '%s' "$RUNS" | jq -r --arg tag "$TAG" '[.workflow_runs[] | select(.head_branch == $tag)] | max_by(.id) | .id')
-          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          echo "已确认 ${TAG} 的构建记录存在（run ${RUN_ID}），镜像将自动更新"
+          echo "run_id=${RUN_ID}" >> "$GITHUB_OUTPUT"
 
       - name: 等待镜像构建完成
         id: wait_build
-        if: steps.latest.outputs.version != steps.current.outputs.version
+        if: steps.dispatch.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ steps.dispatch.outputs.run_id }}
         run: |
           set -uo pipefail
-          RUN_ID="${{ steps.dispatch.outputs.run_id }}"
           if [[ -z "${RUN_ID}" ]]; then
             echo "::error::未获取到构建 run id，无法确认镜像是否发布"
             exit 1
           fi
-          echo "跟踪构建 run: $RUN_ID"
+          echo "跟踪构建 run: ${RUN_ID}"
           for i in $(seq 1 60); do
             sleep 20
-            J=$(curl -fsSL \
-              -H "Authorization: Bearer $GH_TOKEN" \
+            # -f 会在 5xx/瞬时错误时直接失败，这里刻意不用；查询失败只当作本轮无结论
+            J=$(curl -sS --max-time 30 --retry 3 --retry-delay 5 \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
               -H "Accept: application/vnd.github+json" \
-              "$GITHUB_API_URL/repos/${{ github.repository }}/actions/runs/${RUN_ID}")
-            ST=$(printf '%s' "$J" | jq -r '.status')
-            CO=$(printf '%s' "$J" | jq -r '.conclusion // ""')
-            echo "[${i}/60] status=${ST} conclusion=${CO}"
-            if [[ "$ST" == "completed" ]]; then
-              if [[ "$CO" == "success" ]]; then
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}" || true)
+            ST=$(printf '%s' "${J}" | jq -r '.status // empty' 2>/dev/null)
+            CO=$(printf '%s' "${J}" | jq -r '.conclusion // empty' 2>/dev/null)
+            echo "[${i}/60] status=${ST:-<查询失败>} conclusion=${CO:-<无>}"
+            if [[ "${ST}" == "completed" ]]; then
+              if [[ "${CO}" == "success" ]]; then
                 echo "镜像构建发布成功"
                 exit 0
               fi
-              echo "::error::镜像构建失败（conclusion=${CO}），ghcr 镜像未更新：${{ github.server_url }}/${{ github.repository }}/actions/runs/${RUN_ID}"
+              echo "::error::镜像构建失败（conclusion=${CO}），ghcr 镜像未更新：${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}"
               exit 1
             fi
           done
-          echo "::error::等待镜像构建超时（20 分钟），请查看 ${{ github.server_url }}/${{ github.repository }}/actions/runs/${RUN_ID}"
+          echo "::error::等待镜像构建超时（20 分钟），请查看 ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}"
           exit 1
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: 结果汇总
         if: always()
+        env:
+          OLD: ${{ steps.current.outputs.version }}
+          NEW: ${{ steps.latest.outputs.version }}
+          PUBLISHED: ${{ steps.registry.outputs.published }}
+          DISPATCH: ${{ steps.dispatch.outcome }}
+          BUILD: ${{ steps.wait_build.outcome }}
         run: |
-          OLD="${{ steps.current.outputs.version }}"
-          NEW="${{ steps.latest.outputs.version }}"
-          DISPATCH="${{ steps.dispatch.outcome }}"
-          BUILD="${{ steps.wait_build.outcome }}"
           {
             echo "### iVentoy 上游版本跟踪"
             echo ""
             echo "| 项 | 值 |"
             echo "|---|---|"
             echo "| 上游最新 | ${NEW:-<获取失败>} |"
-            echo "| 仓库更新前 | ${OLD:-<读取失败>} |"
-            if [[ -n "$NEW" && "$NEW" != "$OLD" ]]; then
+            echo "| 仓库当前 | ${OLD:-<读取失败>} |"
+            case "${PUBLISHED}" in
+              true)    echo "| ghcr 对账 | 已有 ${OLD} 镜像 |" ;;
+              false)   echo "| ghcr 对账 | **缺少 ${OLD} 镜像，已安排重建** |" ;;
+              *)       echo "| ghcr 对账 | 查询失败，本轮跳过（${PUBLISHED:-unknown}） |" ;;
+            esac
+            if [[ -n "${NEW}" && "${NEW}" != "${OLD}" ]]; then
               echo "| 代码与标签 | 已更新版本引用并创建 refs/tags/v${NEW} |"
-              if [[ "$DISPATCH" != "success" ]]; then
+              if [[ "${DISPATCH}" != "success" ]]; then
                 echo "| 镜像构建 | **派发失败（${DISPATCH:-unknown}），ghcr 镜像不会更新，需人工处理** |"
-              elif [[ "$BUILD" == "success" ]]; then
+              elif [[ "${BUILD}" == "success" ]]; then
                 echo "| 镜像构建 | 已成功发布（ghcr 标签：latest + ${NEW}） |"
-              elif [[ "$BUILD" == "failure" ]]; then
+              elif [[ "${BUILD}" == "failure" ]]; then
                 echo "| 镜像构建 | **构建失败，ghcr 镜像仍为旧版，需人工处理** |"
               else
                 echo "| 镜像构建 | 派发成功但未确认结果（${BUILD:-unknown}） |"
+              fi
+            elif [[ "${PUBLISHED}" == "false" ]]; then
+              if [[ "${BUILD}" == "success" ]]; then
+                echo "| 镜像构建 | 已补齐缺失镜像（版本未变，无代码改动） |"
+              elif [[ "${BUILD}" == "failure" ]]; then
+                echo "| 镜像构建 | **补齐失败，需人工处理** |"
+              else
+                echo "| 镜像构建 | 已派发补齐，结果未确认（${BUILD:-unknown}） |"
               fi
             else
               echo "| 操作 | 已是最新，无需更新 |"

@@ -1,6 +1,7 @@
 #!/bin/sh
 set -eu
 
+# shellcheck disable=SC1007  # CDPATH= cd -- 是"清空 CDPATH 后 cd"的标准写法，非笔误
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 test_dir=$(mktemp -d)
 trap 'rm -rf "${test_dir}"' EXIT HUP INT TERM
