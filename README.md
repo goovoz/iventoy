@@ -11,6 +11,13 @@ Docker Tag:
 
 Images are published to GitHub Container Registry: `ghcr.io/goovoz/iventoy`
 
+Both tags point at the same multi-arch image index, but the two platforms do **not** carry the same edition:
+
+| Platform | Upstream edition | Notes |
+|---|---|---|
+| `linux/amd64` | **Free** | Full feature set |
+| `linux/arm64` | **Trial** | Upstream (ventoy/PXE) only publishes an arm64 *trial* build, so arm64 is not feature-equivalent to amd64 |
+
 The final image is based on `debian:bookworm-slim` — a hard requirement, not a preference: iVentoy ships prebuilt binaries with glibc-linked libraries bundled in `lib/lin64/`, which cannot load under Alpine musl libc. The multi-stage build does download/extract in an Alpine builder stage, so the runtime image carries no build tooling or extra packages. See [docs/UPSTREAM-SYNC.md](docs/UPSTREAM-SYNC.md) for the base-image rationale.
 
 ## Usage
@@ -31,7 +38,7 @@ The default internal iVentoy webserver for serving images is 16000 this is confi
 
 Port 10809 is the NBD (Network Block Device) server iVentoy uses to hand block devices to the booting client.
 
-The complete port list, with the defaults iVentoy 1.0.46 itself reports (`get_config_all` on the built-in web API). Everything except 26000 is configurable on the **Configuration** page — if you change one, update the port mapping too.
+The complete port list, with the defaults iVentoy itself reports (`get_config_all` on the built-in web API). Everything except 26000 is configurable on the **Configuration** page — if you change one, update the port mapping too.
 
   - 26000/26000 TCP = iVentoy Web GUI (fixed, not configurable)
   - 16000/16000 TCP = iVentoy ISO & file server (`http_port`)
@@ -88,6 +95,16 @@ A ready-to-use [docker-compose.yml](docker-compose.yml) is included (image pinne
 docker compose up -d
 ```
 
+The compose file ships three operational defaults that matter in practice:
+
+- `init: true` — iVentoy forks child processes; without an init as PID 1 nobody reaps them.
+- `stop_grace_period: 30s` — iVentoy flushes `config.dat` on shutdown, and plain `docker stop` would SIGKILL it after 10s.
+- `logging` with `max-size` / `max-file` — the log is symlinked to stdout, so it lands in docker's json-file driver; without a cap it grows until the disk is full.
+
+### Health check
+
+The image's `HEALTHCHECK` only proves the **management** service is answering on TCP 26000: it reads the `LISTEN` state of port 26000 out of `/proc/net/tcp{,6}` (the runtime image carries no `curl`/`wget`). It does **not** mean the PXE service is running — that still depends on `IVENTOY_AUTO_RUN=1` and a valid Server IP.
+
 ### Configure your DHCP server
 See the [docs](docs/) folder for examples.
 
@@ -118,7 +135,7 @@ Once your container is up and running go to the IP address of your server on por
 This fork follows the official iVentoy releases from [ventoy/PXE](https://github.com/ventoy/PXE/releases) automatically:
 
 - A scheduled GitHub Actions workflow (`.github/workflows/track-iventoy-release.yml`) checks the upstream release feed every day.
-- When a new stable version appears, it bumps the version references in `Dockerfile`, `Makefile` and `README.md`, pushes the commit to `main`, creates a `vX.Y.Z` tag, triggers the multi-arch image build, and only reports success once the image is actually published. (`docker-compose.yml` always uses `:latest`, so it carries no version.)
-- If the upstream version matches the version in this repository, nothing is pushed.
+- When a new stable version appears, it bumps the version references in `Dockerfile` and `README.md`, pushes the commit to `main`, creates a `vX.Y.Z` tag, triggers the multi-arch image build, and only reports success once the image is actually published. (`docker-compose.yml` uses `:latest` and `Makefile` reads the version out of the `Dockerfile`, so neither carries a version string of its own.)
+- If the upstream version matches the version in this repository, nothing is pushed — but the workflow still **reconciles the registry**: if `ghcr.io/goovoz/iventoy:<version>` is missing (a previous build failed, the dispatch was rejected, or the tag was pruned), it re-dispatches the build and fails loudly instead of leaving the image silently stuck on an older release.
 
 You can also run it manually: **Actions → "Track iVentoy Upstream Release" → Run workflow** (optionally pinning an explicit version). See [docs/UPSTREAM-SYNC.md](docs/UPSTREAM-SYNC.md) for the full mechanism.

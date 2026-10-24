@@ -1,7 +1,8 @@
 name: Cleanup Package Versions
 
-# 手动清理 ghcr 包内多余版本：保留 KEEP_TAGS 指向的 index 及其子 manifest（多架构平台
-# 镜像 + attestation），删除其余所有版本（含历史未打标签的残留与已废弃标签）。
+# 手动清理 ghcr 包内多余版本。
+# 默认保留：latest + Dockerfile 当前版本 + 次新版本（可回滚一档），其余全部删除。
+# 也可以传 keep_tags 显式指定（逗号分隔的 tag 名，如 "latest,1.0.47,1.0.46"）。
 # 注意：多架构镜像的「untagged」子 manifest 是镜像本体，必须保留，删掉会导致镜像拉取失败。
 
 on:
@@ -11,6 +12,10 @@ on:
         description: "true = 仅列出计划；false = 实际删除"
         required: true
         default: "true"
+      keep_tags:
+        description: "要保留的 tag（逗号分隔）；留空 = latest + 当前版本 + 次新版本"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -21,45 +26,103 @@ jobs:
     runs-on: ubuntu-latest
     env:
       PKG: iventoy
-      KEEP_TAGS: "latest,1.0.45"
       DRY_RUN: ${{ inputs.dry_run }}
+      KEEP_INPUT: ${{ inputs.keep_tags }}
+      OWNER: ${{ github.repository_owner }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - name: Build keep set (index + child manifests)
+      # 默认保留策略要读 Dockerfile 的当前版本，所以必须 checkout
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve keep tags
+        id: keep
         run: |
           set -euo pipefail
-          OWNER="${{ github.repository_owner }}"
-          RESP=$(curl -s "https://ghcr.io/token?scope=repository:${OWNER}/${PKG}:pull&service=ghcr.io")
-          TOKEN=$(printf '%s' "$RESP" | jq -r .token)
+          if [[ -n "${KEEP_INPUT// /}" ]]; then
+            KEEP_TAGS="${KEEP_INPUT}"
+            echo "使用显式 keep_tags：${KEEP_TAGS}"
+          else
+            CUR=$(grep -oP 'IVENTOY_VERSION:-\K[0-9]+\.[0-9]+\.[0-9]+' Dockerfile | head -1 || true)
+            if [[ -z "${CUR}" ]]; then
+              echo "::error::Dockerfile 中解析不出当前版本，无法计算默认保留集合"
+              exit 1
+            fi
+            TOKEN=$(curl -sS "https://ghcr.io/token?scope=repository:${OWNER}/${PKG}:pull&service=ghcr.io" | jq -r '.token // empty')
+            if [[ -z "${TOKEN}" ]]; then
+              echo "::error::获取 ghcr token 失败"
+              exit 1
+            fi
+            ALL=$(curl -sS -H "Authorization: Bearer ${TOKEN}" \
+              "https://ghcr.io/v2/${OWNER}/${PKG}/tags/list?n=1000" \
+              | jq -r '.tags[]?' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V || true)
+            PREV=$(printf '%s\n' "${ALL}" | awk -v cur="${CUR}" '$0==cur{idx=NR} {a[NR]=$0} END{if (idx>1) print a[idx-1]}')
+            if [[ -n "${PREV}" ]]; then
+              KEEP_TAGS="latest,${CUR},${PREV}"
+            else
+              KEEP_TAGS="latest,${CUR}"
+            fi
+            echo "当前版本 ${CUR}，次新版本 ${PREV:-<无>}"
+          fi
+          echo "keep_tags=${KEEP_TAGS}" >> "$GITHUB_OUTPUT"
+          echo "最终保留集合：${KEEP_TAGS}"
+
+      - name: Build keep set (index + child manifests)
+        env:
+          KEEP_TAGS_OUT: ${{ steps.keep.outputs.keep_tags }}
+        run: |
+          set -euo pipefail
+          TOKEN=$(curl -sS "https://ghcr.io/token?scope=repository:${OWNER}/${PKG}:pull&service=ghcr.io" | jq -r '.token // empty')
+          if [[ -z "${TOKEN}" ]]; then
+            echo "::error::获取 ghcr token 失败"
+            exit 1
+          fi
           ACCEPT="application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json"
           : > /tmp/keep.txt
-          IFS=',' read -ra TAGS <<< "$KEEP_TAGS"
+          # tag 列表经 env 传入，不直接插值进脚本
+          IFS=',' read -ra TAGS <<< "${KEEP_TAGS_OUT}"
           for raw in "${TAGS[@]}"; do
             t=$(printf '%s' "$raw" | xargs)
             [ -z "$t" ] && continue
-            IDX=$(curl -s -H "Authorization: Bearer $TOKEN" -H "Accept: $ACCEPT" \
+            IDX=$(curl -sS -H "Authorization: Bearer $TOKEN" -H "Accept: $ACCEPT" \
               "https://ghcr.io/v2/${OWNER}/${PKG}/manifests/${t}")
             printf '%s' "$IDX" | jq -r '.manifests[]?.digest' >> /tmp/keep.txt || true
-            DG=$(curl -sI -H "Authorization: Bearer $TOKEN" -H "Accept: $ACCEPT" \
+            DG=$(curl -sSI -H "Authorization: Bearer $TOKEN" -H "Accept: $ACCEPT" \
               "https://ghcr.io/v2/${OWNER}/${PKG}/manifests/${t}" \
               | grep -i '^docker-content-digest' | awk '{print $2}' | tr -d '\r')
             [ -n "$DG" ] && echo "$DG" >> /tmp/keep.txt
             echo "keep tag ${t} -> index ${DG:-<header 缺失>}"
           done
           sort -u /tmp/keep.txt -o /tmp/keep.txt
+          if [[ ! -s /tmp/keep.txt ]]; then
+            echo "::error::保留集合为空（tag 名可能已失效），中止以免删掉全部镜像"
+            exit 1
+          fi
           echo '--- 保留 digest ---'
           cat /tmp/keep.txt
 
       - name: Plan deletions
         run: |
           set -euo pipefail
-          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/user/packages/container/${PKG}/versions?per_page=100" > /tmp/versions.json
+          # 分页取全量：包内版本超过 100 个时，只取第一页会漏删
+          : > /tmp/versions.ndjson
+          for page in $(seq 1 20); do
+            curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/user/packages/container/${PKG}/versions?per_page=100&page=${page}" \
+              > /tmp/page.json
+            COUNT=$(jq 'length' /tmp/page.json)
+            jq -c '.[]' /tmp/page.json >> /tmp/versions.ndjson
+            [ "$COUNT" -lt 100 ] && break
+          done
+          echo "共取到 $(wc -l < /tmp/versions.ndjson) 个版本"
           python3 - <<'PY' > /tmp/plan.txt
           import json
           keep = {x.strip() for x in open('/tmp/keep.txt') if x.strip()}
-          vs = json.load(open('/tmp/versions.json'))
-          for v in vs:
+          for line in open('/tmp/versions.ndjson'):
+              line = line.strip()
+              if not line:
+                  continue
+              v = json.loads(line)
               tags = (v.get('metadata') or {}).get('container', {}).get('tags') or []
               action = 'KEEP' if v['name'] in keep else 'DELETE'
               print(f"{action}\t{v['id']}\t{v['name']}\t{','.join(tags)}")
@@ -84,8 +147,12 @@ jobs:
           fail=0
           while IFS=$'\t' read -r action id name tags; do
             [ "$action" = "DELETE" ] || continue
+            # 双保险：带 latest 标签的版本永不删除
+            case ",${tags}," in
+              *,latest,*) echo "跳过 latest 版本 ${id} ${name}"; continue ;;
+            esac
             echo "删除 ${id} ${name} [${tags}]"
-            code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
+            code=$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE \
               -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
               "https://api.github.com/user/packages/container/${PKG}/versions/${id}")
             echo "  HTTP ${code}"

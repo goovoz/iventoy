@@ -2,19 +2,39 @@ name: Build and Push Docker Images
 
 on:
   push:
+    # [iventoy-fork L1] 只接受语义化版本 tag。此前是 "*"，任意 tag 都能触发构建，
+    # 而 latest 又会无条件刷新，推一个旧 tag 就会把 latest 回退到旧版本。
     tags:
-      - "*"
+      - "v[0-9]+.[0-9]+.[0-9]+"
   workflow_dispatch:
 
 permissions:
-  contents: write
+  # [iventoy-fork L1] 本 workflow 不写仓库内容，只推镜像包：权限收紧到最小集合。
+  contents: read
   packages: write
 
 env:
   REGISTRY_IMAGE: iventoy
 
+# 同一 ref 的构建串行执行，避免两个构建并发抢推 latest / 同一个版本 tag。
+concurrency:
+  group: docker-publish-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  # [iventoy-fork L0] 发布前先跑 entrypoint 自检：启动逻辑是镜像唯一的自有代码，
+  # 之前 tests/ 只在本地 make test 里跑，CI 从不执行。
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Container entrypoint self-test
+        run: sh tests/test-container-entrypoint.sh
+
   build:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -25,16 +45,20 @@ jobs:
 
       # [iventoy-fork L1] fork 不继承上游仓库的 secrets。未配置 Docker Hub 凭据时
       # 只发布到 ghcr.io，避免 login/push 步骤直接失败。
+      # secrets 一律经 env 传入，不直接插值进 shell，避免特殊字符破坏脚本。
       - name: Resolve publish targets
         id: targets
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
           set -euo pipefail
-          GHCR_IMAGE="ghcr.io/${{ github.repository_owner }}/${{ env.REGISTRY_IMAGE }}"
-          if [[ -n "${{ secrets.DOCKERHUB_USERNAME }}" && -n "${{ secrets.DOCKERHUB_TOKEN }}" ]]; then
+          GHCR_IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER}/${REGISTRY_IMAGE}"
+          if [[ -n "${DOCKERHUB_USERNAME}" && -n "${DOCKERHUB_TOKEN}" ]]; then
             echo "dockerhub=true" >> "$GITHUB_OUTPUT"
             {
               echo "images<<EOF"
-              echo "${{ secrets.DOCKERHUB_USERNAME }}/${{ env.REGISTRY_IMAGE }}"
+              echo "${DOCKERHUB_USERNAME}/${REGISTRY_IMAGE}"
               echo "$GHCR_IMAGE"
               echo "EOF"
             } >> "$GITHUB_OUTPUT"
@@ -49,14 +73,13 @@ jobs:
           fi
 
       - name: Login to Docker Hub
-        if: github.event_name != 'pull_request' && steps.targets.outputs.dockerhub == 'true'
+        if: steps.targets.outputs.dockerhub == 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Login to GitHub Container Registry
-        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -65,17 +88,34 @@ jobs:
 
       # [iventoy-fork L1] tag 事件取 tag 版本；其余触发（含 track-iventoy-release.yml
       # 的派发与手动 dispatch）改为读取 Dockerfile 当前默认版本。
-      # 原实现为非 tag 时硬编码回退值，会构建出过期版本。
+      # 任何解析失败都直接中止：静默回落到 Dockerfile 默认值会产出 tag 与内容不符的镜像。
       - name: Extract version
         id: version
         run: |
-          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            VERSION=${GITHUB_REF#refs/tags/}
-            VERSION=${VERSION#v}
-          else
-            VERSION=$(grep -oP 'IVENTOY_VERSION:-\K[0-9][0-9.]*' Dockerfile | head -1)
+          set -euo pipefail
+          PATTERN='IVENTOY_VERSION:-\K[0-9]+\.[0-9]+\.[0-9]+'
+          DEFAULT_VERSION=$(grep -oP "$PATTERN" Dockerfile | head -1 || true)
+          if [[ ! "${DEFAULT_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Dockerfile 中解析不出 IVENTOY_VERSION 默认值（'${DEFAULT_VERSION}'），终止构建"
+            exit 1
           fi
-          echo "iventoy_version=${VERSION}" >> $GITHUB_OUTPUT
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+            VERSION="${VERSION#[vV]}"
+          else
+            VERSION="${DEFAULT_VERSION}"
+          fi
+          if [[ ! "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::无法从 ref '${GITHUB_REF}' 解析出合法版本号（'${VERSION}'），终止构建"
+            exit 1
+          fi
+          if [[ "${VERSION}" != "${DEFAULT_VERSION}" ]]; then
+            echo "::warning::tag 版本 ${VERSION} 与 Dockerfile 默认版本 ${DEFAULT_VERSION} 不一致，本次不更新 latest"
+            echo "is_default=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_default=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "iventoy_version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Extract metadata
         id: meta
@@ -83,18 +123,19 @@ jobs:
         with:
           images: ${{ steps.targets.outputs.images }}
           tags: |
-            # [iventoy-fork L1] 标签策略：只保留 latest + 精确版本号（1.0.45 这类），
-            # 不再产出 major/minor/branch 浮动标签，保持包内标签干净。详见 docs/UPSTREAM-SYNC.md。
-            type=raw,value=latest,enable=${{ github.event_name != 'pull_request' }}
+            # [iventoy-fork L1] 标签策略：latest + 精确版本号（1.0.47 这类），不产出
+            # major/minor/branch 浮动标签。latest 只在「tag 版本 == Dockerfile 默认版本」
+            # 或非 tag 触发（dispatch）时更新，推旧 tag 不会把 latest 回退。
+            type=raw,value=latest,enable=${{ steps.version.outputs.is_default == 'true' }}
             type=semver,pattern={{version}}
 
       - name: Build and push
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
           platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name != 'pull_request' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           # [iventoy-fork L1] 关闭 provenance/SBOM attestation：它们会在镜像 index 里
@@ -103,5 +144,7 @@ jobs:
           sbom: false
           build-args: |
             IVENTOY_VERSION=${{ steps.version.outputs.iventoy_version }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # [iventoy-fork L1] gha 缓存默认按 ref 隔离，每个新 tag 都冷启动。
+          # 显式 scope 让所有 tag / 分支共用同一份缓存。
+          cache-from: type=gha,scope=iventoy
+          cache-to: type=gha,mode=max,scope=iventoy

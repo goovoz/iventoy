@@ -1,6 +1,6 @@
 ---
 # 镜像统一走 ghcr.io/goovoz/iventoy:latest（跟随本仓库自动发布的最新版本）。
-# 需要钉版本时把 :latest 换成 :1.0.46 之类的精确 tag（每个版本都同时发布 latest 与 X.Y.Z）。
+# 需要钉版本时把 :latest 换成 :X.Y.Z 之类的精确 tag（每个版本都同时发布 latest 与 X.Y.Z）。
 services:
     iventoy:
         image: ghcr.io/goovoz/iventoy:latest
@@ -9,6 +9,12 @@ services:
         restart: unless-stopped
         # iVentoy 需要操作网络接口与挂载，必须 privileged
         privileged: true
+        # [iventoy-fork] 用 tini 当 PID 1：iVentoy 会 fork 子进程，容器里没有 init 时
+        # 僵尸进程无人回收，SIGTERM 也只能发给主进程。
+        init: true
+        # [iventoy-fork] iVentoy 收到 SIGTERM 后要落盘 config.dat，默认 10s 不够，
+        # 超时就会被 SIGKILL，配置改动可能丢失。
+        stop_grace_period: 30s
         environment:
             TZ: Asia/Shanghai
             # 自动启动默认关闭：先在 Web UI 里确认 Server IP、并把 DHCP 模式设成 External，
@@ -19,7 +25,14 @@ services:
             - /data/iventoy/iso:/iventoy/iso
             - /data/iventoy/driver:/iventoy/driver
             - /data/iventoy/user:/iventoy/user
-        # 端口默认值取自 iVentoy 1.0.46 内置 Web UI（get_config_all）。
+        # [iventoy-fork] 镜像把 log/log.txt 软链到容器 stdout，iVentoy 的日志会全部进
+        # docker 的 json-file。默认没有大小上限，长期运行会把宿主盘写满。
+        logging:
+            driver: json-file
+            options:
+                max-size: "20m"
+                max-file: "5"
+        # 端口默认值取自 iVentoy 内置 Web UI（get_config_all）。
         # 除 26000 外的 TCP 端口都能在 Configuration 页改，改了这里也要跟着改。
         ports:
             - 26000:26000 # Web UI（固定，不可配置）

@@ -1,0 +1,82 @@
+name: Validate
+
+# [iventoy-fork L0] 静态检查 + 启动逻辑自测 + 可选的真实构建。
+# 之前仓库里只有 tests/ 和 Makefile 的 test 目标，CI 从不执行；Dockerfile 也只有
+# 发版那一刻才被编译，改动出错要等下一次 tag 才知道。
+#
+# - lint：每次 push / PR 都跑（shellcheck + yamllint + hadolint + entrypoint 自测）
+# - build：只在 workflow_dispatch 或 fix/ 分支上跑，真实编译一次镜像但不推送
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  YAMLLINT_CONFIG: >-
+    {extends: default,
+     rules: {line-length: disable, comments: disable, comments-indentation: disable,
+             document-start: disable, truthy: disable, brackets: disable}}
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: shellcheck
+        run: shellcheck --severity=warning files/docker-entrypoint.sh tests/test-container-entrypoint.sh
+
+      - name: yamllint
+        run: |
+          set -euo pipefail
+          # 用 venv 装：ubuntu-24.04 runner 的系统 python 是 PEP 668 托管环境，
+          # 直接 pip install 会被 externally-managed-environment 拒绝
+          python3 -m venv /tmp/yl
+          /tmp/yl/bin/pip install --quiet --disable-pip-version-check yamllint
+          /tmp/yl/bin/yamllint -d "${YAMLLINT_CONFIG}" .github/workflows docker-compose.yml
+
+      - name: hadolint
+        run: |
+          set -euo pipefail
+          # 用官方发布的静态二进制：hadolint/hadolint 镜像的 ENTRYPOINT 在不同 tag 上
+          # 行为不一致（曾出现把 --failure-threshold 当成可执行文件），二进制最省心
+          curl -fsSL -o /tmp/hadolint \
+            https://github.com/hadolint/hadolint/releases/latest/download/hadolint-Linux-x86_64
+          chmod +x /tmp/hadolint
+          /tmp/hadolint --failure-threshold error Dockerfile
+
+      - name: Container entrypoint self-test
+        run: sh tests/test-container-entrypoint.sh
+
+  build:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/heads/fix/')
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 只验证两个架构都能编译（含 sha256 校验、解包结构断言），不推送任何镜像
+      - name: Build (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: false
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=iventoy
