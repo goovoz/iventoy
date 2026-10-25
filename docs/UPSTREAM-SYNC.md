@@ -61,7 +61,7 @@ iVentoy 官方发布源：[ventoy/PXE releases](https://github.com/ventoy/PXE/re
 - 发布前先跑 `tests/test-container-entrypoint.sh`（`needs: test`），不通过不构建
 - gha 缓存显式指定 `scope=iventoy`：默认按 ref 隔离，否则每个新 tag 都是冷启动
 
-## 底包选型（为什么 final 必须是 debian:bookworm-slim）
+## 底包选型（为什么 final 必须是 debian 系，以及为什么是 trixie）
 
 iVentoy 官方预编译二进制与 `lib/lin64/` 下的捆绑库全部是 glibc 链接（实证：`ldd` 只依赖
 `libc.so.6` / `libpthread.so.0` / `libdl.so.2`，其余全部解析到捆绑库）。Alpine 使用 musl libc，
@@ -71,10 +71,22 @@ iVentoy 官方预编译二进制与 `lib/lin64/` 下的捆绑库全部是 glibc 
 
 | 阶段 | 底包 | 职责 |
 |---|---|---|
-| builder | `alpine:3.20`（3.5MB） | 仅用 busybox wget/tar 下载解压，不执行二进制 |
-| final | `debian:bookworm-slim`（26.9MB） | 只承载 `/iventoy` 运行时，零 apt 包 |
+| builder | `alpine:3.24`（3.5MB） | 仅用 busybox wget/tar 下载解压，不执行二进制 |
+| final | `debian:trixie-slim`（28.5MB，按索引 digest 钉死） | 只承载 `/iventoy` 运行时，零自装 apt 包 |
 
-- debian 优于 ubuntu：更小、包更少、支持期更长（Debian 12 到 2028+，Ubuntu 22.04 标准支持 2027-04 截止）
+- debian 优于 ubuntu：更小、包更少、支持期更长（Debian 13 到 2030+，Ubuntu 22.04 标准支持 2027-04 截止）
+- **2026-10-25 从 bookworm 换到 trixie**：Docker Hub 的镜像扫描对 bookworm 版报 High 8 / Medium 4 /
+  Low 38，全部落在 Debian 12 的基础包（util-linux 家族占大头），iVentoy 自身零命中。
+  trivy 实测这些漏洞在 Debian 12 **没有任何可用修复版本**（affected 169 / fix_deferred 41 /
+  will_not_fix 17），所以对 bookworm 做 apt upgrade 一条都修不掉，只有换底包是真解。
+  换 trixie 后 227 条降到 161 条（HIGH 56 → 43，CRITICAL 1 → 0），体积 64.7MB → 66.9MB（+3.4%）。
+- final 底包**按索引 digest 钉死**（`debian:trixie-slim@sha256:62bd423a…`）而不是用滚动 tag：
+  可复现、不受官方重推影响。注意必须钉**索引（manifest list / OCI index）digest**——
+  Docker Hub 镜像页右边那栏 `MANIFEST DIGEST` 是当前选中架构的单平台清单，
+  钉它会在另一个架构上静默用错底包（实测钉 386 的清单能在 amd64 上「构建成功」但产物是 i386）。
+  刷新：`docker buildx imagetools inspect debian:trixie-slim`。
+  钉底包不冻结安全更新：final 阶段的 `apt-get upgrade` 仍会装当前最新的包。
+- 回退方式：Dockerfile 里那行 `FROM` 改回 `debian:bookworm-slim`，其余不用动。
 - builder 底包随 alpine 的 2 年支持期滚动：`3.20` 已于 **2026-04-01 EOL**，现为 `3.24`
 - builder 用官方 alpine，不用任何个人 convenience 镜像（供应链最小化）
 - 下载完整性：上游自 1.0.47 起随 release 附 `sha256.txt`，Dockerfile 会取来校验 tar.gz；
@@ -136,3 +148,16 @@ git merge upstream/main
 
 Dockerfile 已按「解包到临时目录 → 探测唯一顶层目录 → mv 成 /iventoy」处理，
 不依赖具体目录名；并校验 `lib/iventoy` 存在，缺失时立即报错并打印目录清单。
+
+## Docker Hub 的 tag 清理（cleanup-dockerhub.yml）
+
+ghcr 的版本由 `cleanup-package.yml` 管；Docker Hub 是另一套 API（hub.docker.com 的 REST + JWT，
+凭据用 `DOCKERHUB_TOKEN`），所以单独一个 workflow：`cleanup-dockerhub.yml`
+（每天 04:47 + 手动，`dry_run` 默认 true，也支持 `keep_tags` 显式指定）。
+
+保留策略与 ghcr 一致：**latest + 当前版本 + 次新版本**（留一档回滚）。
+当前版本从 Dockerfile 读，次新版本按语义化版本号挑。
+
+能力边界（Hub API 限制，不是偷懒）：**Hub 只开放「删 tag」的接口，没有删 manifest 的公开接口**。
+删掉 tag 后底层镜像变成未标记状态，Hub 什么时候回收不由我们控制。
+所以这个 workflow 保证的是「tag 列表干净」，不是「底层字节一定消失」。

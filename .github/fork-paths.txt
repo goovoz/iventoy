@@ -8,6 +8,8 @@
 docs/UPSTREAM-SYNC.md
 .dockerignore
 tests/test-container-entrypoint.sh
+.github/workflows/cleanup-dockerhub.yml
+.github/scripts/prune-dockerhub-tags.py
 DOCKERHUB.md
 deploy/docker-compose.yml
 .github/scripts/sync-dockerhub-page.py

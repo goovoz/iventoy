@@ -1,0 +1,49 @@
+name: Cleanup Docker Hub Tags (fork)
+
+# [iventoy-fork L0] 清理 Docker Hub 仓库里多余的 tag，保留策略与 ghcr 的
+# cleanup-package.yml 一致：latest + 当前版本 + 次新版本（留一档回滚）。
+#
+# 为什么单独一个 workflow：Hub 的 API 与 ghcr 完全不同（Hub 走 hub.docker.com 的
+# REST + JWT，凭据是 DOCKERHUB_TOKEN；ghcr 走 GitHub packages API）。
+# 能力差异要知道：**Hub 只开放「删 tag」，没有删 manifest 的公开接口**，
+# 所以这里保证的是「tag 列表干净」，未标记的底层镜像由 Hub 自行回收。
+#
+# 手动：Actions → Cleanup Docker Hub Tags (fork) → Run workflow
+#   dry_run    true = 只列计划（默认）
+#   keep_tags  显式保留集合，留空 = latest + 当前 + 次新
+
+on:
+  schedule:
+    - cron: "47 20 * * *" # 每天 20:47 UTC（北京时间次日 04:47）
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "true = 仅列出计划；false = 实际删除"
+        required: true
+        default: "true"
+      keep_tags:
+        description: "要保留的 tag（逗号分隔）；留空 = latest + 当前版本 + 次新版本"
+        required: false
+        default: ""
+
+permissions:
+  contents: read # 只读仓库（为了读 Dockerfile 里的当前版本）
+
+jobs:
+  prune:
+    name: 清理多余的 tag
+    runs-on: ubuntu-latest
+    env:
+      PKG: iventoy
+      DRY_RUN: ${{ inputs.dry_run || 'true' }}
+      HUB_KEEP_TAGS: ${{ inputs.keep_tags || '' }}
+    steps:
+      # 默认保留策略要读 Dockerfile 的当前版本，所以必须 checkout
+      - uses: actions/checkout@v4
+
+      - name: 按保留策略清理 tag
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          REGISTRY_IMAGE: ${{ env.PKG }}
+        run: python3 .github/scripts/prune-dockerhub-tags.py
