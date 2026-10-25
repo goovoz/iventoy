@@ -8,6 +8,10 @@
 docs/UPSTREAM-SYNC.md
 .dockerignore
 tests/test-container-entrypoint.sh
+DOCKERHUB.md
+deploy/docker-compose.yml
+.github/scripts/sync-dockerhub-page.py
+.github/scripts/check-dockerhub-readme.py
 
 # L1 对上游文件的最小改动（均带 [iventoy-fork] 锚点注释）：
 #   .github/workflows/docker-publish.yml  —— 发布链路（secrets 容错、版本来源、latest 门控、缓存 scope）
