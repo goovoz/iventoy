@@ -199,3 +199,91 @@ jobs:
           set -euo pipefail
           echo "目标仓库：${DOCKERHUB_USERNAME}/${REGISTRY_IMAGE}"
           python3 .github/scripts/sync-dockerhub-page.py
+
+      # [iventoy-fork L1] 扫「真正发布出去的那个镜像」。Docker Hub 自己也会扫，但它的
+      # 计数口径和阈值都不透明；这里用同一套 trivy 口径在流水线里留痕，并且 CRITICAL 直接失败。
+      # 只扫 amd64：OS 基础包两个架构同一来源，arch 差异不改变结论，省一半时间。
+      - name: 漏洞扫描（trivy，CRITICAL 即失败）
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+          IMAGE: ${{ steps.version.outputs.iventoy_version }}
+          SMOKE_REGISTRY: ${{ steps.targets.outputs.ghcr == 'true' && format('ghcr.io/{0}', github.repository_owner) || secrets.DOCKERHUB_USERNAME }}
+        run: |
+          set -euo pipefail
+          REG="${SMOKE_REGISTRY}"
+          IMG="${REG}/${REGISTRY_IMAGE}:${IMAGE}"
+          echo "扫描对象：${IMG}（amd64）"
+          VER=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
+              https://api.github.com/repos/aquasecurity/trivy/releases/latest | python3 -c 'import json,sys;print(json.load(sys.stdin)["tag_name"])')
+          curl -fsSL -o /tmp/trivy.tgz \
+              "https://github.com/aquasecurity/trivy/releases/download/${VER}/trivy_${VER#v}_Linux-64bit.tar.gz"
+          tar -xzf /tmp/trivy.tgz -C /usr/local/bin trivy && chmod +x /usr/local/bin/trivy
+          trivy image --no-progress --severity CRITICAL,HIGH,MEDIUM,LOW \
+              --format json "${IMG}" > /tmp/trivy.json
+          python3 - <<'PY'
+          import json, os
+          from collections import Counter
+          d = json.load(open('/tmp/trivy.json'))
+          sev = Counter()
+          pkgs = Counter()
+          for r in (d.get('Results') or []):
+              for v in (r.get('Vulnerabilities') or []):
+                  sev[v['Severity']] += 1
+                  pkgs[v.get('PkgName')] += 1
+          total = sum(sev.values())
+          lines = [
+              '| 级别 | 条数 |', '|---|---|',
+              '| CRITICAL | %d |' % sev.get('CRITICAL', 0),
+              '| HIGH | %d |' % sev.get('HIGH', 0),
+              '| MEDIUM | %d |' % sev.get('MEDIUM', 0),
+              '| LOW | %d |' % sev.get('LOW', 0),
+              '', '命中最多的包：' + '、'.join('%s(%d)' % kv for kv in pkgs.most_common(6)),
+          ]
+          print('\n'.join(lines))
+          summary = os.environ.get('GITHUB_STEP_SUMMARY')
+          if summary:
+              with open(summary, 'a', encoding='utf-8') as fh:
+                  fh.write('### 镜像漏洞扫描（trivy）\n\n' + '\n'.join(lines) + '\n')
+          if sev.get('CRITICAL', 0):
+              print('::error::存在 CRITICAL 级漏洞，禁止发布')
+              raise SystemExit(1)
+          print('无 CRITICAL，放行（HIGH 及以下仅记录，不拦截）')
+          PY
+
+      # [iventoy-fork L1] 镜像能不能真的跑起来，只有扫漏洞是看不出来的。
+      # 这里把刚发布的镜像按架构拉下来起一遍，确认 WebUI（26000）能应答：
+      # 换底包 / 换上游版本这类改动，最先坏的就是「起不来」，而这个检查能当场抓住。
+      # 两个架构串行跑（26000 只能占用一次），arm64 走 QEMU（setup-qemu 已注册 binfmt）。
+      - name: 冒烟：按架构起容器并确认 WebUI 应答
+        env:
+          IMAGE: ${{ steps.version.outputs.iventoy_version }}
+          SMOKE_REGISTRY: ${{ steps.targets.outputs.ghcr == 'true' && format('ghcr.io/{0}', github.repository_owner) || secrets.DOCKERHUB_USERNAME }}
+        run: |
+          set -euo pipefail
+          REG="${SMOKE_REGISTRY}"
+          IMG="${REG}/${REGISTRY_IMAGE}:${IMAGE}"
+          rc=0
+          for arch in amd64 arm64; do
+            name="iv-smoke-${arch}"
+            docker rm -f "$name" >/dev/null 2>&1 || true
+            echo "--- ${arch}: docker run --platform linux/${arch} ${IMG} ---"
+            if ! docker run -d --name "$name" --platform "linux/${arch}" \
+                --privileged -p 26000:26000 --restart no "$IMG" >/dev/null; then
+              echo "::error::${arch} 容器启动失败"; rc=1; continue
+            fi
+            code=000
+            for i in $(seq 1 25); do
+              sleep 3
+              code=$(curl -s -o /tmp/smoke.html -w '%{http_code}' --max-time 5 http://127.0.0.1:26000/ || echo 000)
+              [ "$code" = "200" ] && break
+            done
+            if [ "$code" = "200" ]; then
+              echo "  ${arch} WebUI -> HTTP 200（$(wc -c < /tmp/smoke.html) 字节）"
+            else
+              echo "::error::${arch} WebUI 无应答（最后 HTTP ${code}）"
+              docker logs "$name" 2>&1 | tail -15 | sed 's/^/    /'
+              rc=1
+            fi
+            docker rm -f "$name" >/dev/null 2>&1 || true
+          done
+          exit $rc

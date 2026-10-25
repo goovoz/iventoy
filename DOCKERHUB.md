@@ -121,6 +121,23 @@ image: deemop/iventoy:1.0.47   # 钉死版本，升级由你决定
 
 `latest` 只在「上游出新版」时前移，不会被旧 tag 的重建回退。出问题就改回上一个版本号，`docker compose up -d` 即可。
 
+## 安全与漏洞扫描
+
+镜像基于 `debian:trixie-slim`（Debian 13）。Docker Hub 或 trivy 扫出来的 CRITICAL / HIGH /
+MEDIUM / LOW **全部来自 Debian 的基础包，不是 iVentoy 自身**——iVentoy 的二进制与自带库
+零命中。选 trixie 而不是 bookworm 就是冲着这个：同样口径下扫描量从 227 条降到 161 条
+（HIGH 56 → 43，CRITICAL 1 → 0）。
+
+发布流水线每次都会做两件事：
+
+- 用 trivy 扫**实际发布出去的那个镜像**，出现 CRITICAL 直接让发布失败；HIGH 及以下写进 Job Summary 留痕
+- 按 amd64 / arm64 各起一次容器，确认 Web UI（26000）能应答——换底包、换上游版本最容易坏的就是「起不来」
+
+Debian 基础包的安全更新在构建时就随 `apt-get upgrade` 进镜像，不必等上游 iVentoy 发新版本。
+
+使用上还有两点值得注意：容器必须 `privileged`（iVentoy 要挂载目录、操作网卡），
+所以请只把它放在你信任的内网里；Web UI 的 26000 不要直接暴露到公网。
+
 ## 限制与注意
 
 - **arm64 是 trial 版**：上游只给 arm64 提供 trial 资产，功能/授权以官网为准。

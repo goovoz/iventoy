@@ -50,7 +50,35 @@ RUN case "${TARGETARCH}" in \
     mkdir -p /usr/share/iventoy/data && \
     cp /iventoy/data/iventoy.dat /iventoy/data/mac.db /usr/share/iventoy/data/
 
-FROM debian:bookworm-slim
+# [iventoy-fork] 底包 bookworm-slim → trixie-slim（Debian 12 → 13）。
+# 原因：Docker Hub 的镜像扫描对上链镜像报 High 8 / Medium 4 / Low 38，全部落在 Debian 12
+# 的基础包（util-linux 家族占了大头，另有 libc6 / gnutls / perl-base…），iVentoy 自身零命中。
+# trivy 实测：bookworm 227 条（H56/M87/L83/C1）→ trixie 161 条（H43/M58/L60/C0），降约 29%。
+# 关键前提：这些漏洞在 Debian 12 **没有可用的修复版本**（trivy 判定 227 条全部 FixedVersion 为空，
+# 其中 fix_deferred 41、will_not_fix 17），所以在 Dockerfile 里 apt upgrade 对旧底包毫无作用 ——
+# 只有换底包是真解。
+# 兼容性已实测：glibc 2.36 → 2.41（向前兼容），entrypoint 的 ldd 自检两个底包都是 0 未解析依赖；
+# WebUI 冒烟两边都是 HTTP 200，AUTO_RUN 行为一致。体积 205MB → 209MB（+4MB）。
+# 要回退：把下面这行改回 debian:bookworm-slim，其余不用动。
+#
+# 底包按 digest 钉死（debian:trixie-slim@sha256:62bd423a…），两个原因：
+#   1. 可复现：同样的提交永远构建出同样的底包，不会被官方某次重推改变
+#   2. 防标签漂移：trixie-slim 是滚动 tag，今天拉到的和下周拉到的可能不是同一份
+# 注意钉的必须是**索引（manifest list / OCI index）digest**，不是某个架构的 manifest digest：
+# 我们是 amd64 + arm64 双架构构建，钉单架构清单会让另一个架构用错底包甚至直接失败。
+# Docker Hub 的镜像页右边那栏「MANIFEST DIGEST」是当前选中架构的单平台清单
+# （例如 linux/386 是 sha256:549d769b…），页面顶部的「INDEX DIGEST」才是要钉的那个。
+# 刷新 digest： docker buildx imagetools inspect debian:trixie-slim   （取 Name 里的 Digest）
+# 钉底包不会冻结安全更新：下面 final 阶段的 apt-get upgrade 仍会装当前最新的包。
+FROM debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
+
+# [iventoy-fork] 构建时把基础包的安全更新装进去：让 Debian 后续发布的修复直接进镜像，
+# 不必等上游 iVentoy 发新版本。它不引入新包（本镜像依然是「零自装 apt 包」），只是升级已有包。
+# 代价：构建依赖 deb.debian.org 可达（GitHub runner 正常可达）；apt 列表用完即清，不留在镜像里。
+# 注意：今天这一条还看不到收益（trixie 当前也没有这些包的修复版），价值在后续。
+RUN apt-get update \
+    && apt-get -y upgrade \
+    && rm -rf /var/lib/apt/lists/*
 
 # [iventoy-fork] 这里不再声明 IVENTOY_VERSION：它是构建期信息，运行时不可切换，
 # 残留成 ENV 只会让人误以为 docker run -e IVENTOY_VERSION=... 能换版本。
