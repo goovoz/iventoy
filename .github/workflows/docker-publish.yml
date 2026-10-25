@@ -250,10 +250,18 @@ jobs:
           print('无 CRITICAL，放行（HIGH 及以下仅记录，不拦截）')
           PY
 
+      # [iventoy-fork L1] 给宿主内核注册 qemu binfmt。
+      # buildx 的 docker-container driver 自带 qemu，所以上面的多架构构建不需要它；
+      # 但下面的冒烟用 `docker run --platform linux/arm64`，走的是宿主内核 ——
+      # 没有 binfmt 时 arm64 容器会直接 ENOEXEC（exec format error），
+      # 而构建阶段是完全正常的，很容易误判成「镜像坏了」。
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
       # [iventoy-fork L1] 镜像能不能真的跑起来，只有扫漏洞是看不出来的。
       # 这里把刚发布的镜像按架构拉下来起一遍，确认 WebUI（26000）能应答：
       # 换底包 / 换上游版本这类改动，最先坏的就是「起不来」，而这个检查能当场抓住。
-      # 两个架构串行跑（26000 只能占用一次），arm64 走 QEMU（setup-qemu 已注册 binfmt）。
+      # 两个架构串行跑（26000 只能占用一次）。
       - name: 冒烟：按架构起容器并确认 WebUI 应答
         env:
           IMAGE: ${{ steps.version.outputs.iventoy_version }}
@@ -266,13 +274,27 @@ jobs:
           for arch in amd64 arm64; do
             name="iv-smoke-${arch}"
             docker rm -f "$name" >/dev/null 2>&1 || true
-            echo "--- ${arch}: docker run --platform linux/${arch} ${IMG} ---"
+            # 先删掉上一个架构残留的本地镜像：否则 docker 可能直接复用本地那份，
+            # 拉到的就不是目标架构（表现就是 exec format error）
+            docker rmi -f "${IMG}" >/dev/null 2>&1 || true
+            echo "--- ${arch}: 拉取并运行 ${IMG} ---"
+            if ! docker pull --quiet --platform "linux/${arch}" "${IMG}" >/dev/null; then
+              echo "::error::${arch} 拉取失败"; rc=1; continue
+            fi
+            got=$(docker image inspect -f '{{.Architecture}}' "${IMG}" 2>/dev/null || echo unknown)
+            if [ "${got}" != "${arch}" ]; then
+              echo "::error::${arch} 拉到的镜像架构是 '${got}'，与预期不符"
+              rc=1; continue
+            fi
+            echo "  架构校验通过：${got}"
             if ! docker run -d --name "$name" --platform "linux/${arch}" \
                 --privileged -p 26000:26000 --restart no "$IMG" >/dev/null; then
               echo "::error::${arch} 容器启动失败"; rc=1; continue
             fi
+            tries=25
+            [ "${arch}" = "arm64" ] && tries=45   # QEMU 下启动明显更慢，多给一倍时间
             code=000
-            for i in $(seq 1 25); do
+            for i in $(seq 1 ${tries}); do
               sleep 3
               code=$(curl -s -o /tmp/smoke.html -w '%{http_code}' --max-time 5 http://127.0.0.1:26000/ || echo 000)
               [ "$code" = "200" ] && break
