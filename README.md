@@ -2,7 +2,7 @@
 
 This is a docker container packaging up the iVentoy tool [https://iventoy.com](https://iventoy.com)
 
-The image is based on Debian 12 Bookworm slim. iVentoy runs in foreground mode so Docker can supervise it directly and stop it cleanly.
+The image is based on Debian 13 trixie slim. iVentoy runs in foreground mode so Docker can supervise it directly and stop it cleanly.
 
 ## Versions
 
