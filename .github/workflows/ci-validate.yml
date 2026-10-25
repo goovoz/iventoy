@@ -43,7 +43,12 @@ jobs:
           # 直接 pip install 会被 externally-managed-environment 拒绝
           python3 -m venv /tmp/yl
           /tmp/yl/bin/pip install --quiet --disable-pip-version-check yamllint
-          /tmp/yl/bin/yamllint -d "${YAMLLINT_CONFIG}" .github/workflows docker-compose.yml
+          /tmp/yl/bin/yamllint -d "${YAMLLINT_CONFIG}" .github/workflows docker-compose.yml deploy/docker-compose.yml
+
+      # Docker Hub 说明页里贴了一份可直接复制的 compose，仓库里又有 deploy/docker-compose.yml
+      # 供 curl -O 使用。两份必须一致，否则部署方会照着过期的那份跑。
+      - name: Docs consistency (DOCKERHUB.md ↔ deploy/docker-compose.yml)
+        run: python3 .github/scripts/check-dockerhub-readme.py
 
       - name: hadolint
         run: |

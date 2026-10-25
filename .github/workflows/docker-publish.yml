@@ -7,6 +7,16 @@ on:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
   workflow_dispatch:
+    inputs:
+      targets:
+        description: "发布到哪里"
+        type: choice
+        options:
+          - both # ghcr.io + Docker Hub（默认）
+          - hub # 只推 Docker Hub（用它补铺/修 Hub 上的镜像，不动 ghcr）
+          - ghcr # 只推 ghcr.io
+        default: both
+        required: false
 
 permissions:
   # [iventoy-fork L1] 本 workflow 不写仓库内容，只推镜像包：权限收紧到最小集合。
@@ -46,31 +56,52 @@ jobs:
       # [iventoy-fork L1] fork 不继承上游仓库的 secrets。未配置 Docker Hub 凭据时
       # 只发布到 ghcr.io，避免 login/push 步骤直接失败。
       # secrets 一律经 env 传入，不直接插值进 shell，避免特殊字符破坏脚本。
+      #
+      # targets 输入支持「只推 Hub / 只推 ghcr」：补铺 Docker Hub 时不必顺带重建 ghcr
+      # （ghcr 上同一版本已经有 digest，重推只会多一个孤儿 digest）。
       - name: Resolve publish targets
         id: targets
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          WANT: ${{ inputs.targets || 'both' }}
         run: |
           set -euo pipefail
           GHCR_IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER}/${REGISTRY_IMAGE}"
+          HUB_IMAGE="${DOCKERHUB_USERNAME}/${REGISTRY_IMAGE}"
+          HAVE_HUB=false
           if [[ -n "${DOCKERHUB_USERNAME}" && -n "${DOCKERHUB_TOKEN}" ]]; then
-            echo "dockerhub=true" >> "$GITHUB_OUTPUT"
-            {
-              echo "images<<EOF"
-              echo "${DOCKERHUB_USERNAME}/${REGISTRY_IMAGE}"
-              echo "$GHCR_IMAGE"
-              echo "EOF"
-            } >> "$GITHUB_OUTPUT"
-          else
-            echo "dockerhub=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::未配置 DOCKERHUB_USERNAME / DOCKERHUB_TOKEN secrets，本次仅发布到 ghcr.io"
-            {
-              echo "images<<EOF"
-              echo "$GHCR_IMAGE"
-              echo "EOF"
-            } >> "$GITHUB_OUTPUT"
+            HAVE_HUB=true
           fi
+
+          IMAGES=""
+          case "${WANT}" in
+            both) WANT_HUB=$HAVE_HUB; WANT_GHCR=true ;;
+            hub)  WANT_HUB=$HAVE_HUB; WANT_GHCR=false ;;
+            ghcr) WANT_HUB=false;     WANT_GHCR=true ;;
+            *) echo "::error::未知 targets='${WANT}'"; exit 1 ;;
+          esac
+
+          if [[ "${WANT_HUB}" == "true" ]]; then
+            IMAGES="${HUB_IMAGE}"$'\n'
+            echo "::notice::Docker Hub 目标仓库：${HUB_IMAGE}"
+          elif [[ "${WANT}" == "hub" ]]; then
+            echo "::error::targets=hub 但未配置 DOCKERHUB_USERNAME / DOCKERHUB_TOKEN"
+            exit 1
+          else
+            echo "::notice::未配置 Docker Hub 凭据（或未选择），本次不推 Docker Hub"
+          fi
+          if [[ "${WANT_GHCR}" == "true" ]]; then
+            IMAGES="${IMAGES}${GHCR_IMAGE}"$'\n'
+          fi
+
+          {
+            echo "dockerhub=${WANT_HUB}"
+            echo "ghcr=${WANT_GHCR}"
+            echo "images<<EOF"
+            printf '%s' "${IMAGES}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Login to Docker Hub
         if: steps.targets.outputs.dockerhub == 'true'
@@ -80,6 +111,7 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Login to GitHub Container Registry
+        if: steps.targets.outputs.ghcr == 'true'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -128,6 +160,10 @@ jobs:
             # 或非 tag 触发（dispatch）时更新，推旧 tag 不会把 latest 回退。
             type=raw,value=latest,enable=${{ steps.version.outputs.is_default == 'true' }}
             type=semver,pattern={{version}}
+            # [iventoy-fork L1] 显式补一个等于当前版本号的 raw 标签：type=semver 只在
+            # ref 是 tag 时才生效，而 tracker / 手动 dispatch 是「无 tag」触发 —— 少了这行，
+            # dispatch 出来的镜像只有 latest，Docker Hub 上会缺精确版本号，没法钉版本回滚。
+            type=raw,value=${{ steps.version.outputs.iventoy_version }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -148,3 +184,19 @@ jobs:
           # 显式 scope 让所有 tag / 分支共用同一份缓存。
           cache-from: type=gha,scope=iventoy
           cache-to: type=gha,mode=max,scope=iventoy
+
+      # [iventoy-fork L1] 构建成功后把 DOCKERHUB.md 同步成 Docker Hub 的说明页
+      # （短描述 + 正文 README）。只在「更新 latest」的那次同步，避免旧 tag 重建时
+      # 把页面改回旧文档；失败只告警、不拦发布（文档不同步不该让镜像发布变红）。
+      - name: Sync Docker Hub page
+        if: steps.targets.outputs.dockerhub == 'true' && steps.version.outputs.is_default == 'true'
+        continue-on-error: true
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          REGISTRY_IMAGE: ${{ env.REGISTRY_IMAGE }}
+        run: |
+          set -euo pipefail
+          echo "目标仓库：${DOCKERHUB_USERNAME}/${REGISTRY_IMAGE}"
+          python3 .github/scripts/sync-dockerhub-page.py
+

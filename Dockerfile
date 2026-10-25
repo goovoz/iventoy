@@ -12,6 +12,10 @@ ARG TARGETARCH
 # [iventoy-fork] 上游自 1.0.47 起随 release 提供 sha256.txt（列出两个 linux tar.gz 的
 # sha256）。这里做完整性校验：能取到且有条目就强制匹配，取不到只告警——
 # 旧版本重建（dispatch 指定老版本）时不会因为缺 sha256.txt 而失败。
+#
+# 取 hash 用 shell 参数展开（${ACTUAL%% *}）而不是 `sha256sum ... | awk`：init 阶段用的是
+# 默认 /bin/sh（没有 pipefail），管道前段失败会被 awk 的空输出吞掉，报错会变成
+# 「mismatch (got )」这种误导信息；无管道也就顺手满足 hadolint DL4006。
 RUN case "${TARGETARCH}" in \
       amd64) ARCH_SUFFIX="x86_64"; EDITION="free" ;; \
       arm64) ARCH_SUFFIX="arm64"; EDITION="trial" ;; \
@@ -24,7 +28,9 @@ RUN case "${TARGETARCH}" in \
     if wget -q --timeout=60 --tries=3 "${BASE}/sha256.txt" -O /tmp/sha256.txt; then \
         EXPECTED=$(awk -v f="${ASSET}" '$2 == f || $2 == "./" f {print $1; exit}' /tmp/sha256.txt); \
         if [ -n "${EXPECTED}" ]; then \
-            ACTUAL=$(sha256sum /tmp/iventoy.tar.gz | awk '{print $1}'); \
+            ACTUAL=$(sha256sum /tmp/iventoy.tar.gz); \
+            ACTUAL=${ACTUAL%% *}; \
+            [ -n "${ACTUAL}" ] || { echo "ERROR: 读不出 ${ASSET} 的 sha256（sha256sum 失败）"; exit 1; }; \
             [ "${ACTUAL}" = "${EXPECTED}" ] || { echo "ERROR: ${ASSET} sha256 mismatch (expected ${EXPECTED}, got ${ACTUAL})"; exit 1; }; \
             echo "sha256 verified: ${EXPECTED}"; \
         else \
@@ -59,8 +65,9 @@ RUN ln -sf /proc/1/fd/1 /iventoy/log/log.txt
 # [iventoy-fork] 镜像内刻意不装 curl/wget（零 apt 包），用 /proc/net 探测 Web GUI
 # 26000 端口的 LISTEN 状态做健康检查：26000 = 0x6590，LISTEN = 0A。
 # 注意：这只代表「管理服务已就绪」，不代表 PXE 服务在跑（后者由 IVENTOY_AUTO_RUN 控制）。
+# 用 JSON 形式（hadolint DL3025）：参数不经镜像的 shell 二次解析，行为不受 SHELL 指令影响。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | grep -qE ':6590 [0-9A-F:]+ 0A'
+    CMD ["/bin/sh", "-c", "cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | grep -qE ':6590 [0-9A-F:]+ 0A'"]
 
 # [iventoy-fork] EXPOSE 只是文档性质（不影响实际监听），但与 iVentoy 真实端口保持一致：
 #   26000 Web UI（固定，WebUI 端口本身不可改）
