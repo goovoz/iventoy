@@ -199,4 +199,3 @@ jobs:
           set -euo pipefail
           echo "目标仓库：${DOCKERHUB_USERNAME}/${REGISTRY_IMAGE}"
           python3 .github/scripts/sync-dockerhub-page.py
-
