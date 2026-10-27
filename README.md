@@ -7,7 +7,7 @@ The image is based on Debian 13 trixie slim. iVentoy runs in foreground mode so 
 ## Versions
 
 Docker Tag:
-* latest / 1.0.47: iVentoy v1.0.47
+* latest / 1.0.48: iVentoy v1.0.48
 
 Images are published to GitHub Container Registry: `ghcr.io/goovoz/iventoy`
 
