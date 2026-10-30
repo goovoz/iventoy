@@ -4,7 +4,7 @@
 FROM alpine:3.24 AS init
 
 ARG IVENTOY_VERSION
-ENV IVENTOY_VERSION=${IVENTOY_VERSION:-1.0.48}
+ENV IVENTOY_VERSION=${IVENTOY_VERSION:-1.0.49}
 ARG TARGETARCH
 
 # [iventoy-fork] 上游 1.0.47 起随 release 发 sha256.txt。有就强制校验，没有只告警 ——
