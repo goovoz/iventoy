@@ -4,7 +4,7 @@ IMAGE   ?= ghcr.io/goovoz/iventoy
 ISO_DIR ?= $(CURDIR)/isos
 MAX_CLIENTS ?= 65535
 
-.PHONY: build buildx tag push test localtest
+.PHONY: build buildx tag push test localtest verify
 
 build:
 	docker build --build-arg IVENTOY_MAX_CLIENTS=$(MAX_CLIENTS) . -t iventoy:build
@@ -25,6 +25,19 @@ push:
 test:
 	sh tests/test-container-entrypoint.sh
 
-# 本地起一个来试，ISO 丢进 ./isos
+# 本地起一个来试，ISO 丢进 ./isos；用 host 网络（PXE/TFTP 的广播与 DHCP 全靠它），
+# data 挂出来，重启后分机独启/配置才不会丢。
 localtest:
-	docker run -it -p 26000:26000 -v "$(ISO_DIR)":/iventoy/iso --privileged --name iventoy_dev $(IMAGE):latest
+	mkdir -p "$(CURDIR)/data-out"
+	docker run -it --rm --privileged --net=host \
+		-v "$(ISO_DIR)":/iventoy/iso \
+		-v "$(CURDIR)/data-out":/iventoy/data \
+		--name iventoy_dev $(IMAGE):latest
+
+# 校验已发布镜像里的两份补丁报告与二进制是否对得上（不需要重新构建）
+verify:
+	docker run --rm --entrypoint cat $(IMAGE):latest /iventoy/lib/iventoy > /tmp/iventoy.shipped
+	docker run --rm --entrypoint cat $(IMAGE):latest /usr/share/iventoy/patch.json > /tmp/iventoy.patch.json
+	docker run --rm --entrypoint cat $(IMAGE):latest /usr/share/iventoy/patch-mb.json > /tmp/iventoy.patch-mb.json
+	python3 patches/iventoy_patch.py --verify /tmp/iventoy.patch.json /tmp/iventoy.shipped
+	python3 patches/matrix_boot_hook.py --verify /tmp/iventoy.patch-mb.json /tmp/iventoy.shipped

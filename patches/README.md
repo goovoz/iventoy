@@ -37,31 +37,46 @@
 | 位置 | 免费版行为 |
 |---|---|
 | `pxe_api_add_matrix_boot` | 不解析请求，直接 `snprintf` 回 `{"result":"notsupport"}` |
-| `toy_matrix_boot_add` | `mov eax, -22 ; ret` |
+| `toy_matrix_boot_walk` | 启动恢复回调：只打一行 `Recover matrix boot policy` 日志，**不往链表里放东西** → 重启后条目全丢 |
+| `toy_matrix_boot_add` | `mov eax, -22 ; ret`（没人调用它，接口层根本没走到这里） |
 
-而 `list_json` / `del` / `save` / `recovery` / `proc` / `init` 都是完整实现 —— 也就是说
-记录链表、持久化 TLV、启动流程都在，缺的只是「登记一条」这个入口。所以补法是把入口补回去：
+其余 `list_json` / `del` / `save` / `recovery` / `proc` / `init` 都是完整实现 ——
+记录链表、TLV 持久化、启动流程都在，缺的只是「登记一条」和「恢复时放回链表」两个入口。
+所以补法是接管这两个桩：
 
 | 文件 | 作用 |
 |---|---|
-| `matrix_boot_add.c` | 等价实现：解析 `bios`/`timeout`/`mac`/`path`，校验 MAC 形态，去重，`g_malloc0(0x101c)` 建记录（`+0x00 bios`、`+0x04 timeout`、`+0x08 mac[18]`、`+0x1a path`），挂到 `g_pstEntryList` |
-| `matrix_boot_hook.py` | 把上面的 C 编成机器码块，找可执行落点（RX 段尾部空隙优先，放不下就追加到文件尾并延长 `p_filesz`），把桩改成 `jmp` 进去；带 `--verify` |
+| `matrix_boot_add.c` | 两个入口：`matrix_boot_add_api`（解析 `bios`/`timeout`/`mac`/`path`，校验、去重、建记录、返回 `success`/`exist`/`failed`）和 `matrix_boot_walk_hook`（启动恢复时把记录放回链表） |
+| `matrix_boot_hook.py` | 把上面的 C 编成机器码块，找可执行落点（RX 段尾部的**全零填充**优先，放不下就追加到文件尾并延长 `p_filesz`），再把两个桩改成 `jmp`；带 `--verify` 与 `--check` |
 
-地址全部现场从 ELF 符号表 / PLT 解析，桩的字节形态也要先核对，对不上直接失败。
-构建期在 `$TARGETPLATFORM` 阶段用本机 `gcc` 编译（arm64 在 qemu 下跑），不需要交叉工具链。
+记录布局由 `toy_matrix_boot_list_json` 反推：`+0x00 bios(u8)` / `+0x04 timeout(u32)` /
+`+0x08 mac[18]` / `+0x1a path`，整条 `0x101c` 字节。地址全部现场从符号表 / PLT 解析，
+桩的形态先核对（大小、是否已被注入），对不上直接失败。
 
-功能验证不是「服务起来了」就算：CI 冒烟每次都打一遍真接口 ——
+**恢复回调的参数只有一个**：上游自己的 `toy_matrix_boot_walk(byte *entry)` 就是单参数形态，
+多读第二个参数会拿到调用方没设的寄存器 —— 实测直接段错误（exit 139）。这个坑已经踩过，
+C 里现在签名就是单参数。
+
+构建期在 `$TARGETPLATFORM` 阶段用本机 `gcc` 编译（arm64 在 qemu 下跑，约多一分钟），
+不需要交叉工具链；两份报告都进镜像：`/usr/share/iventoy/patch.json`、`patch-mb.json`。
+
+### 怎么验
+
+CI 的冒烟不是「服务起来了」就算，每次都打真接口并**重启一次容器**：
 
 ```bash
 curl -s -X POST -H 'Content-Type: application/json' \
   -d '{"method":"add_matrix_boot","bios":1,"timeout":30,"mac":"11-22-33-44-55-66","path":"smoke.iso"}' \
-  http://127.0.0.1:26000/iventoy/json      # 期望 { "result" : "success" }
-curl -s -X POST -H 'Content-Type: application/json' -d '{"method":"get_matrix_boot"}' \
-  http://127.0.0.1:26000/iventoy/json      # 期望列表里出现刚加的 MAC
+  http://127.0.0.1:26000/iventoy/json                 # 期望 { "result" : "success" }
+curl -s -X POST -d '{"method":"get_matrix_boot"}' \
+  http://127.0.0.1:26000/iventoy/json                 # 期望列表里有刚加的 MAC
+docker restart <容器>                                  # 关键：恢复回调走的就是这段
+curl -s -X POST -d '{"method":"get_matrix_boot"}' \
+  http://127.0.0.1:26000/iventoy/json                 # 条目还在才算过
 ```
 
-写错会怎样：`add` 返回 `exist`（重复）或 `failed`（MAC 形态不对），列表接口照常工作 ——
-因为用的就是上游自己的 list/del 实现，不是另写一套。
+写错会得到什么：`exist`（重复）或 `failed`（MAC 形态不对）；恢复回调没接上则重启后列表变空。
+列表/删除用的都是上游自己的实现，不是另写一套。
 
 ## 为什么上限是 65535 而不是「无限制」
 
