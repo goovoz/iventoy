@@ -116,8 +116,10 @@ jobs:
             curl -fsSL --retry 3 --retry-delay 5 -o "/tmp/pt/${f}" \
               "https://github.com/ventoy/PXE/releases/download/v${V}/${f}"
             tar -xzf "/tmp/pt/${f}" -C "$dir"
-            echo "--- ${arch} ---"
-            python3 patches/iventoy_patch.py --check "${dir}/iventoy/lib/iventoy" || {
+            src=$(find "$dir" -maxdepth 2 -type d -name iventoy | head -1)
+            [ -n "$src" ] || src="${dir}/iventoy"
+            echo "--- ${arch}: ${src} ---"
+            python3 patches/iventoy_patch.py --check "${src}/lib/iventoy" || {
               echo "::error::v${V} 的 ${arch} 二进制补丁签名失配，本轮不更新版本。请按 patches/README.md 重新锚定后手动 workflow_dispatch"
               exit 1
             }

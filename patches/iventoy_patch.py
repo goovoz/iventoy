@@ -28,6 +28,8 @@ import sys
 from pathlib import Path
 
 EM_X86_64, EM_AARCH64 = 62, 183
+# 6 bytes/record: 1e6 records = 6 MB of .bss, far beyond any DHCP pool
+MAX_CLIENTS_LIMIT = 1_000_000
 RECORD_SIZE = 6
 NOP_X86 = b"\x90"
 NOP_ARM = (0xD503201F).to_bytes(4, "little")
@@ -283,8 +285,7 @@ class Patcher:
                         continue
                     # rewrite adrp -> new page, add -> #0
                     nw_adrp = self._adrp_encode(t_va + i, new_base, rd)
-                    nw_add = (0x91000000 | (rd2 << 5) | rd2)  # placeholder, fixed below
-                    nw_add = 0x91000000 | (rd << 5) | rd2
+                    nw_add = 0x91000000 | (rd << 5) | rd2        # add xD, xN, #0
                     out.append((t_va + i, d[t_off + i:t_off + i + 4],
                                 struct.pack("<I", nw_adrp), "adrp -> new page"))
                     out.append((t_va + j, d[t_off + j:t_off + j + 4],
@@ -295,7 +296,10 @@ class Patcher:
         out.sort(key=lambda x: x[0])
         dedup, end = [], -1
         for cand in out:
-            if cand[0] <= end:
+            # strict '<': an arm64 adrp at i and its add at i+4 are adjacent, and the
+            # add must survive; an x86 66/48-prefixed instruction overlaps a candidate
+            # starting mid-instruction, which must be dropped.
+            if cand[0] < end:
                 continue
             dedup.append(cand)
             end = cand[0] + len(cand[1])
@@ -491,6 +495,10 @@ def main() -> int:
     ap.add_argument("--check", action="store_true", help="report only, write nothing")
     ap.add_argument("--report", help="write a JSON report to this path")
     args = ap.parse_args()
+
+    if not 1 <= args.max_clients <= MAX_CLIENTS_LIMIT:
+        ap.error(f"--max-clients must be between 1 and {MAX_CLIENTS_LIMIT} "
+                 f"(got {args.max_clients})")
 
     raw = Path(args.binary).read_bytes()
     data = bytearray(raw)

@@ -2,15 +2,17 @@
 VERSION ?= $(shell sed -n 's/.*IVENTOY_VERSION:-\([0-9][0-9.]*\).*/\1/p' Dockerfile | head -1)
 IMAGE   ?= ghcr.io/goovoz/iventoy
 ISO_DIR ?= $(CURDIR)/isos
+MAX_CLIENTS ?= 65535
 
 .PHONY: build buildx tag push test localtest
 
 build:
-	docker build . -t iventoy:build
+	docker build --build-arg IVENTOY_MAX_CLIENTS=$(MAX_CLIENTS) . -t iventoy:build
 
 # 只验证两个架构都编得过，不产出可推送的制品（多平台不能 --load）
 buildx:
-	docker buildx build --platform linux/amd64,linux/arm64 . --output type=cacheonly
+	docker buildx build --platform linux/amd64,linux/arm64 \
+		--build-arg IVENTOY_MAX_CLIENTS=$(MAX_CLIENTS) . --output type=cacheonly
 
 tag:
 	docker tag iventoy:build $(IMAGE):latest
