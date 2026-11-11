@@ -97,6 +97,32 @@ jobs:
             fi
           done
 
+      # [iventoy-fork] 补丁闸：先把新版本的两个二进制真正下载下来跑 --check。
+      # 签名失配就停在这里 —— 不 bump 版本、不打 tag、不派发构建，
+      # 避免「镜像能起但 WebUI 消失 / 端口变随机」这种只能靠人肉发现的坏版本。
+      # 重新锚定的步骤见 patches/README.md。
+      - name: 校验补丁能否应用到新版本
+        env:
+          V: ${{ steps.latest.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/pt
+          for spec in "amd64 x86_64 free" "arm64 arm64 trial"; do
+            set -- $spec
+            arch=$1; suffix=$2; edition=$3
+            f="iventoy-${V}-linux-${suffix}-${edition}.tar.gz"
+            dir="/tmp/pt/${arch}"
+            mkdir -p "$dir"
+            curl -fsSL --retry 3 --retry-delay 5 -o "/tmp/pt/${f}" \
+              "https://github.com/ventoy/PXE/releases/download/v${V}/${f}"
+            tar -xzf "/tmp/pt/${f}" -C "$dir"
+            echo "--- ${arch} ---"
+            python3 patches/iventoy_patch.py --check "${dir}/iventoy/lib/iventoy" || {
+              echo "::error::v${V} 的 ${arch} 二进制补丁签名失配，本轮不更新版本。请按 patches/README.md 重新锚定后手动 workflow_dispatch"
+              exit 1
+            }
+          done
+
       # [iventoy-fork] 对账：仓库里的版本号必须真的对应一个已发布的镜像。
       # 查询失败（401/5xx/网络）记为 unknown，本轮不据此判定，避免误触发构建风暴。
       - name: 对账：当前版本镜像是否已发布

@@ -20,6 +20,18 @@ Both tags point at the same multi-arch image index, but the two platforms do **n
 
 The final image is based on `debian:bookworm-slim` — a hard requirement, not a preference: iVentoy ships prebuilt binaries with glibc-linked libraries bundled in `lib/lin64/`, which cannot load under Alpine musl libc. The multi-stage build does download/extract in an Alpine builder stage, so the runtime image carries no build tooling or extra packages. See [docs/UPSTREAM-SYNC.md](docs/UPSTREAM-SYNC.md) for the base-image rationale.
 
+## What this image changes
+
+`lib/iventoy` inside the image is **patched**, applied at build time from [`patches/`](patches/). If the patch no longer matches the upstream binary the build fails — the image is never shipped half-patched.
+
+| Upstream behaviour | In this image |
+|---|---|
+| Free edition caps concurrent PXE clients at 20 (arm64 trial: 1) | 65535 (override with `--build-arg IVENTOY_MAX_CLIENTS=N`) |
+| ARM64 / LoongArch clients are rejected as "not supported in Free Edition" | accepted |
+| Self-SHA-256 check + the port anti-tamper chain behind it | neutralised — mandatory, otherwise the binary exits, or starts with no WebUI, or binds the API to a random port |
+
+The client cap is not a free-floating constant: the client table is a 6-byte-per-client array compiled into the binary, and the admission check indexes it directly. Raising the constant alone writes out of bounds on client N+1, so the patch also relocates the array into freshly mapped zero pages and grows the last `PT_LOAD`. Why three separate sites are needed, how to re-anchor after an upstream release, and the CI gates that enforce it: [`patches/README.md`](patches/README.md).
+
 ## Usage
 
 It uses sysvfs so the container needs to be ran in privileged mode (not ideal!) and also needs port 69 which is in a privileged range.

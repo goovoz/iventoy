@@ -161,3 +161,15 @@ ghcr 的版本由 `cleanup-package.yml` 管；Docker Hub 是另一套 API（hub.
 能力边界（Hub API 限制，不是偷懒）：**Hub 只开放「删 tag」的接口，没有删 manifest 的公开接口**。
 删掉 tag 后底层镜像变成未标记状态，Hub 什么时候回收不由我们控制。
 所以这个 workflow 保证的是「tag 列表干净」，不是「底层字节一定消失」。
+
+## 二进制补丁（patches/）
+
+镜像里的 `lib/iventoy` 是打过补丁的，补丁在构建期应用，**签名失配就让构建失败**，不会产出「能起但功能残缺」的镜像。
+
+原因：补丁改的是编译期常量与三处自校验分支，上游只要换编译器 / 改函数形状，地址和指令就全变。所以补丁不写死地址，靠符号表 + 指令签名定位，并且有三道闸：
+
+1. `ci-validate.yml` 的 `patch` 作业 —— 每次 push/PR 对当前固定版本跑 `--check`，失配立即红。
+2. `track-iventoy-release.yml` —— 自动跟版前先对新版本跑 `--check`；不通过就停在原地，不 bump、不打 tag、不派发构建。
+3. `docker-publish.yml` —— 发布后按架构起容器验 26000 返回 200，并断言镜像内 `/usr/share/iventoy/patch.json` 的 `ok` 为 true。
+
+签名失配的典型表现、重新锚定步骤、以及「为什么上限是 65535 而不是无限制」，见 [patches/README.md](../patches/README.md)。
