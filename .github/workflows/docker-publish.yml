@@ -2,8 +2,16 @@ name: Build and Push Docker Images
 
 on:
   push:
-    # [iventoy-fork L1] 只接受语义化版本 tag。此前是 "*"，任意 tag 都能触发构建，
+    # [iventoy-fork L2] main 上的日常提交也要出镜像 —— 只出 :edge 开发通道。
+    #
+    # 2026-11-11 故障：补丁改了三轮、PR 全合并进 main，但本 workflow 只在 push tag
+    # 与手动 dispatch 时运行，于是 ghcr 上的 latest / 1.0.49 一直停在打补丁之前那份，
+    # 代码进了 main 而镜像没进。main 提交→:edge 让「代码是否真的变成镜像」当场可见。
+    #
+    # [iventoy-fork L1] tag 只接受语义化版本号。此前是 "*"，任意 tag 都能触发构建，
     # 而 latest 又会无条件刷新，推一个旧 tag 就会把 latest 回退到旧版本。
+    branches:
+      - main
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
   workflow_dispatch:
@@ -27,14 +35,28 @@ env:
   REGISTRY_IMAGE: iventoy
 
 # 同一 ref 的构建串行执行，避免两个构建并发抢推 latest / 同一个版本 tag。
+# main 上的 :edge 构建允许被新提交取代（同一个开发通道只留最新一次）；tag / dispatch
+# 的发布构建绝不取消 —— 半途取消会在 registry 上留下不完整的多架构索引。
+#
+# [iventoy-fork L2] main 的 edge 构建单独成组：tracker 的漂移对账会用 ref=main 派发
+# 一次**发布**构建，两者落在同一个 ref 上。共用一组的话，发布构建会把正在推送的 edge
+# 构建取消掉（反之亦然）。分组按「分支 + 事件」拆开，发布构建之间仍然互相串行。
 concurrency:
-  group: docker-publish-${{ github.ref }}
-  cancel-in-progress: false
+  group: docker-publish-${{ github.ref }}${{ (github.ref == 'refs/heads/main' && github.event_name == 'push') && '-edge' || '' }}
+  cancel-in-progress: ${{ github.ref == 'refs/heads/main' && github.event_name == 'push' }}
 
 jobs:
   # [iventoy-fork L0] 发布前先跑 entrypoint 自检：启动逻辑是镜像唯一的自有代码，
   # 之前 tests/ 只在本地 make test 里跑，CI 从不执行。
+  #
+  # track-iventoy-release.yml 的版本 bump 提交（`chore: auto-update iVentoy ...`）
+  # 会在同一次运行里紧接着打 tag，那条 tag 推送会触发完整的发布构建；
+  # bump 提交自己再出一次 :edge 纯属重复，这里直接跳过。
   test:
+    if: >-
+      github.event_name != 'push'
+      || github.ref != 'refs/heads/main'
+      || !contains(github.event.head_commit.message, 'auto-update iVentoy')
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -53,18 +75,38 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # [iventoy-fork L2] 先定通道：main 的推送是 edge，其余（tag / dispatch）是发布。
+      # 通道决定后面三件事——推哪些 tag、能不能动 latest、用哪个 tag 做冒烟。
+      - name: Resolve build channel
+        id: channel
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          MODE="release"
+          if [[ "${EVENT}" == "push" && "${REF}" == "refs/heads/main" ]]; then
+            MODE="edge"
+            echo "::notice::main 分支构建：本次只发布 :edge，不动 latest / 版本号"
+          fi
+          echo "mode=${MODE}" >> "$GITHUB_OUTPUT"
+
       # [iventoy-fork L1] fork 不继承上游仓库的 secrets。未配置 Docker Hub 凭据时
       # 只发布到 ghcr.io，避免 login/push 步骤直接失败。
       # secrets 一律经 env 传入，不直接插值进 shell，避免特殊字符破坏脚本。
       #
       # targets 输入支持「只推 Hub / 只推 ghcr」：补铺 Docker Hub 时不必顺带重建 ghcr
       # （ghcr 上同一版本已经有 digest，重推只会多一个孤儿 digest）。
+      #
+      # [iventoy-fork L2] edge 通道只推 ghcr：Docker Hub 上的镜像保持「latest + 精确版本号」
+      # 这条对外承诺，不引入会漂移的浮动 tag。
       - name: Resolve publish targets
         id: targets
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
           WANT: ${{ inputs.targets || 'both' }}
+          MODE: ${{ steps.channel.outputs.mode }}
         run: |
           set -euo pipefail
           GHCR_IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER}/${REGISTRY_IMAGE}"
@@ -75,20 +117,26 @@ jobs:
           fi
 
           IMAGES=""
-          case "${WANT}" in
-            both) WANT_HUB=$HAVE_HUB; WANT_GHCR=true ;;
-            hub)  WANT_HUB=$HAVE_HUB; WANT_GHCR=false ;;
-            ghcr) WANT_HUB=false;     WANT_GHCR=true ;;
-            *) echo "::error::未知 targets='${WANT}'"; exit 1 ;;
-          esac
+          if [[ "${MODE}" == "edge" ]]; then
+            WANT_HUB=false
+            WANT_GHCR=true
+            echo "::notice::edge 通道只推 ghcr.io，跳过 Docker Hub"
+          else
+            case "${WANT}" in
+              both) WANT_HUB=$HAVE_HUB; WANT_GHCR=true ;;
+              hub)  WANT_HUB=$HAVE_HUB; WANT_GHCR=false ;;
+              ghcr) WANT_HUB=false;     WANT_GHCR=true ;;
+              *) echo "::error::未知 targets='${WANT}'"; exit 1 ;;
+            esac
+          fi
 
           if [[ "${WANT_HUB}" == "true" ]]; then
             IMAGES="${HUB_IMAGE}"$'\n'
             echo "::notice::Docker Hub 目标仓库：${HUB_IMAGE}"
-          elif [[ "${WANT}" == "hub" ]]; then
+          elif [[ "${WANT}" == "hub" && "${MODE}" != "edge" ]]; then
             echo "::error::targets=hub 但未配置 DOCKERHUB_USERNAME / DOCKERHUB_TOKEN"
             exit 1
-          else
+          elif [[ "${MODE}" != "edge" ]]; then
             echo "::notice::未配置 Docker Hub 凭据（或未选择），本次不推 Docker Hub"
           fi
           if [[ "${WANT_GHCR}" == "true" ]]; then
@@ -119,10 +167,15 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # [iventoy-fork L1] tag 事件取 tag 版本；其余触发（含 track-iventoy-release.yml
-      # 的派发与手动 dispatch）改为读取 Dockerfile 当前默认版本。
+      # 的派发、手动 dispatch、main 的 edge 构建）改为读取 Dockerfile 当前默认版本。
       # 任何解析失败都直接中止：静默回落到 Dockerfile 默认值会产出 tag 与内容不符的镜像。
+      #
+      # image_tag 才是下游真正使用的镜像 tag：发布通道是版本号，edge 通道是 edge。
+      # is_default 只在发布通道才可能为 true —— edge 永远不会更新 latest。
       - name: Extract version
         id: version
+        env:
+          MODE: ${{ steps.channel.outputs.mode }}
         run: |
           set -euo pipefail
           PATTERN='IVENTOY_VERSION:-\K[0-9]+\.[0-9]+\.[0-9]+'
@@ -141,13 +194,23 @@ jobs:
             echo "::error::无法从 ref '${GITHUB_REF}' 解析出合法版本号（'${VERSION}'），终止构建"
             exit 1
           fi
-          if [[ "${VERSION}" != "${DEFAULT_VERSION}" ]]; then
-            echo "::warning::tag 版本 ${VERSION} 与 Dockerfile 默认版本 ${DEFAULT_VERSION} 不一致，本次不更新 latest"
-            echo "is_default=false" >> "$GITHUB_OUTPUT"
+          if [[ "${MODE}" == "edge" ]]; then
+            IMAGE_TAG="edge"
+            IS_DEFAULT=false
           else
-            echo "is_default=true" >> "$GITHUB_OUTPUT"
+            IMAGE_TAG="${VERSION}"
+            if [[ "${VERSION}" != "${DEFAULT_VERSION}" ]]; then
+              echo "::warning::tag 版本 ${VERSION} 与 Dockerfile 默认版本 ${DEFAULT_VERSION} 不一致，本次不更新 latest"
+              IS_DEFAULT=false
+            else
+              IS_DEFAULT=true
+            fi
           fi
-          echo "iventoy_version=${VERSION}" >> "$GITHUB_OUTPUT"
+          {
+            echo "iventoy_version=${VERSION}"
+            echo "image_tag=${IMAGE_TAG}"
+            echo "is_default=${IS_DEFAULT}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Extract metadata
         id: meta
@@ -158,12 +221,16 @@ jobs:
             # [iventoy-fork L1] 标签策略：latest + 精确版本号（1.0.47 这类），不产出
             # major/minor/branch 浮动标签。latest 只在「tag 版本 == Dockerfile 默认版本」
             # 或非 tag 触发（dispatch）时更新，推旧 tag 不会把 latest 回退。
-            type=raw,value=latest,enable=${{ steps.version.outputs.is_default == 'true' }}
-            type=semver,pattern={{version}}
+            #
+            # [iventoy-fork L2] 加一条独立通道 :edge——只在 main 分支推送时产出，
+            # 用来回答「main 上的代码现在长成什么样」，发布标签一律不参与。
+            type=raw,value=latest,enable=${{ steps.channel.outputs.mode == 'release' && steps.version.outputs.is_default == 'true' }}
+            type=semver,pattern={{version}},enable=${{ steps.channel.outputs.mode == 'release' }}
             # [iventoy-fork L1] 显式补一个等于当前版本号的 raw 标签：type=semver 只在
             # ref 是 tag 时才生效，而 tracker / 手动 dispatch 是「无 tag」触发 —— 少了这行，
             # dispatch 出来的镜像只有 latest，Docker Hub 上会缺精确版本号，没法钉版本回滚。
-            type=raw,value=${{ steps.version.outputs.iventoy_version }}
+            type=raw,value=${{ steps.version.outputs.iventoy_version }},enable=${{ steps.channel.outputs.mode == 'release' }}
+            type=raw,value=edge,enable=${{ steps.channel.outputs.mode == 'edge' }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -207,7 +274,7 @@ jobs:
       - name: 漏洞扫描（trivy，CRITICAL 即失败）
         env:
           GH_TOKEN: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
-          IMAGE: ${{ steps.version.outputs.iventoy_version }}
+          IMAGE: ${{ steps.version.outputs.image_tag }}
           SMOKE_REGISTRY: ${{ steps.targets.outputs.ghcr == 'true' && format('ghcr.io/{0}', github.repository_owner) || secrets.DOCKERHUB_USERNAME }}
         run: |
           set -euo pipefail
@@ -265,7 +332,7 @@ jobs:
       # 两个架构串行跑（26000 只能占用一次）。
       - name: 冒烟：按架构起容器并确认 WebUI 应答
         env:
-          IMAGE: ${{ steps.version.outputs.iventoy_version }}
+          IMAGE: ${{ steps.version.outputs.image_tag }}
           SMOKE_REGISTRY: ${{ steps.targets.outputs.ghcr == 'true' && format('ghcr.io/{0}', github.repository_owner) || secrets.DOCKERHUB_USERNAME }}
         run: |
           set -euo pipefail
@@ -325,7 +392,7 @@ jobs:
       # 用补丁脚本的 --verify 逐站点对字节：任何一处被跳过 / 被回滚都会红。
       - name: 校验镜像内二进制与补丁报告一致
         env:
-          IMAGE: ${{ steps.version.outputs.iventoy_version }}
+          IMAGE: ${{ steps.version.outputs.image_tag }}
           SMOKE_REGISTRY: ${{ steps.targets.outputs.ghcr == 'true' && format('ghcr.io/{0}', github.repository_owner) || secrets.DOCKERHUB_USERNAME }}
         run: |
           set -euo pipefail
@@ -335,3 +402,26 @@ jobs:
           docker run --rm --entrypoint cat "$IMG" /usr/share/iventoy/patch.json > /tmp/shipped.json
           ls -l /tmp/shipped.bin /tmp/shipped.json
           python3 patches/iventoy_patch.py --verify /tmp/shipped.json /tmp/shipped.bin
+
+      # [iventoy-fork L2] 一轮构建到底发布成了什么，写进 run summary：
+      # 通道、tag、源码提交、补丁上限。看 run 列表就能判断「这份镜像对应哪份代码」。
+      - name: 发布摘要
+        if: always()
+        env:
+          MODE: ${{ steps.channel.outputs.mode }}
+          VERSION: ${{ steps.version.outputs.iventoy_version }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+          REV: ${{ github.sha }}
+          PATCHED: ${{ vars.IVENTOY_MAX_CLIENTS || '65535' }}
+        run: |
+          {
+            echo "### 镜像构建"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 通道 | ${MODE:-<未知>} |"
+            echo "| 上游版本 | ${VERSION:-<未知>} |"
+            echo "| 源码提交 | \`${REV}\` |"
+            echo "| 客户端上限 | ${PATCHED} |"
+            echo "| tags | $(printf '%s' "${TAGS:-<无>}" | paste -sd' ' -) |"
+          } >> "$GITHUB_STEP_SUMMARY"

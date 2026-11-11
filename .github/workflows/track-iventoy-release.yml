@@ -3,10 +3,17 @@ name: Track iVentoy Upstream Release
 # 自动跟随 iVentoy 官方发布（https://github.com/ventoy/PXE/releases）。
 # 上游出现新的稳定版时：自动改版本引用 -> 提交推送 main -> 打 vX.Y.Z 标签 -> 触发镜像构建发布。
 #
-# [iventoy-fork] 上游无新版本时**不再直接空跑**：会先对账 ghcr 上是否存在当前版本的镜像。
-# 若缺失（上一次构建失败 / 被清理 / 派发 403），会重新派发构建并在失败时变红。
-# 否则一旦「版本已 bump 但镜像没发出去」，第二天起 current == latest 就永远空跑，
-# 镜像会静默停在旧版本（2026-10-21 的 1.0.46 故障即此类）。
+# [iventoy-fork] 上游无新版本时**不再直接空跑**，而是做两件事：
+#   1. 对账 ghcr 上是否存在当前版本的镜像。若缺失（上一次构建失败 / 被清理 / 派发 403），
+#      重新派发构建并在失败时变红。否则一旦「版本已 bump 但镜像没发出去」，第二天起
+#      current == latest 就永远空跑，镜像会静默停在旧版本（2026-10-21 的 1.0.46 故障即此类）。
+#   2. 对账「发布出去的镜像」与 main 的源码漂移：镜像里记着构建它的提交号（OCI label
+#      org.opencontainers.image.revision），只要 main 上还有没进镜像的镜像相关改动
+#      （Dockerfile / files/ / patches/ / .dockerignore），就按 main 重新发布一次。
+#      2026-11-11 的故障即此类：补丁改了三轮、PR 全合并进 main，但「合并到 main」不会触发
+#      docker-publish，ghcr 上的 latest / 1.0.49 一直停在打补丁之前那份。
+#      main 的日常提交另有 :edge 开发通道（docker-publish 的 push: branches: [main]），
+#      这里补的是**发布标签**的漂移，两条路互不替代。
 #
 # 机制详见 docs/UPSTREAM-SYNC.md。
 
@@ -169,8 +176,130 @@ jobs:
               ;;
           esac
 
+      # [iventoy-fork L2] 源码漂移对账。
+      #
+      # 判定口径：镜像 config 里的 org.opencontainers.image.revision（构建它的提交）与
+      # main 的 HEAD 在「影响镜像内容的路径」上是否有差异。docs/、README、workflow 之类
+      # 的提交不重建镜像 —— 否则每天都会白跑一次多架构构建。
+      #
+      # 只在「版本没变且镜像已发布」时判定：版本变更与镜像缺失两种情况各有自己的派发路径，
+      # 这里再判一次会重复构建。
+      - name: 对账：发布镜像与 main 的源码漂移
+        id: drift
+        if: >-
+          steps.latest.outputs.version == steps.current.outputs.version
+          && steps.registry.outputs.published == 'true'
+        env:
+          OWNER: ${{ github.repository_owner }}
+          VERSION: ${{ steps.current.outputs.version }}
+        run: |
+          set -uo pipefail
+          # 影响镜像内容的路径；其余改动不触发重建
+          IMAGE_PATHS=(Dockerfile .dockerignore files patches)
+          HEAD_SHA=$(git rev-parse HEAD)
+
+          TOKEN=""
+          for attempt in 1 2 3; do
+            TOKEN=$(curl -sS --max-time 20 \
+              "https://ghcr.io/token?scope=repository:${OWNER}/${PACKAGE}:pull&service=ghcr.io" \
+              | jq -r '.token // empty') || TOKEN=""
+            [[ -n "${TOKEN}" ]] && break
+            echo "第 ${attempt} 次获取 ghcr token 失败，重试"
+            sleep 5
+          done
+          if [[ -z "${TOKEN}" ]]; then
+            echo "::warning::取 ghcr token 失败，本轮不做漂移判定"
+            echo "drift=unknown" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          ACCEPT="application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json"
+          MAN=$(curl -sS --max-time 30 -H "Authorization: Bearer ${TOKEN}" -H "Accept: ${ACCEPT}" \
+            "https://ghcr.io/v2/${OWNER}/${PACKAGE}/manifests/${VERSION}") || MAN=""
+          # 多架构索引：先定位 linux/amd64 子清单，再取它的 config blob
+          CHILD=$(printf '%s' "${MAN}" \
+            | jq -r '[.manifests[]? | select(.platform.os == "linux" and .platform.architecture == "amd64") | .digest] | first // empty' 2>/dev/null)
+          if [[ -n "${CHILD}" ]]; then
+            MAN=$(curl -sS --max-time 30 -H "Authorization: Bearer ${TOKEN}" -H "Accept: ${ACCEPT}" \
+              "https://ghcr.io/v2/${OWNER}/${PACKAGE}/manifests/${CHILD}") || MAN=""
+          fi
+          CFG=$(printf '%s' "${MAN}" | jq -r '.config.digest // empty' 2>/dev/null)
+          if [[ -z "${CFG}" ]]; then
+            echo "::warning::读不到 ${VERSION} 镜像的 config digest，本轮不做漂移判定"
+            echo "drift=unknown" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          REV=$(curl -sS --max-time 30 -H "Authorization: Bearer ${TOKEN}" \
+            "https://ghcr.io/v2/${OWNER}/${PACKAGE}/blobs/${CFG}" \
+            | jq -r '.config.Labels["org.opencontainers.image.revision"] // empty' 2>/dev/null) || REV=""
+          if [[ -z "${REV}" ]]; then
+            echo "::warning::镜像里没有 org.opencontainers.image.revision 标签，无法判定漂移"
+            echo "drift=unknown" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "镜像 ${VERSION} 构建自：${REV}"
+          echo "main 当前 HEAD：    ${HEAD_SHA}"
+
+          if [[ "${REV}" == "${HEAD_SHA}" ]]; then
+            echo "::notice::镜像就是 main 的最新提交，无漂移"
+            echo "drift=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! git cat-file -e "${REV}^{commit}" 2>/dev/null; then
+            echo "::warning::镜像记录的提交 ${REV} 不在本仓库历史里（可能来自已删除的分支），按有漂移处理"
+            echo "drift=true" >> "$GITHUB_OUTPUT"
+            echo "reason=unknown-sha" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # diff 出错（退出码 128 等）时按有漂移处理：宁可多重建一次，也不要漏掉补丁改动
+          if git diff --quiet "${REV}" "${HEAD_SHA}" -- "${IMAGE_PATHS[@]}"; then
+            echo "::notice::${REV} 之后的提交没有碰 ${IMAGE_PATHS[*]}，无需重建"
+            echo "drift=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "--- 未进镜像的改动 ---"
+            git diff --stat "${REV}" "${HEAD_SHA}" -- "${IMAGE_PATHS[@]}" | tail -20
+            echo "::warning::${VERSION} 镜像缺少 ${REV}..${HEAD_SHA} 之间的镜像相关改动，将按 main 重新发布"
+            echo "drift=true" >> "$GITHUB_OUTPUT"
+            echo "reason=source-drift" >> "$GITHUB_OUTPUT"
+          fi
+
+      # [iventoy-fork L2] 把「要不要发、发哪个 ref」收敛成一处理，避免多个 if 条件互相打架。
+      # 优先级：新版本 > 镜像缺失 > 源码漂移 > 无事可做。
+      - name: 决定本轮动作
+        id: plan
+        env:
+          OLD: ${{ steps.current.outputs.version }}
+          NEW: ${{ steps.latest.outputs.version }}
+          PUBLISHED: ${{ steps.registry.outputs.published }}
+          DRIFT: ${{ steps.drift.outputs.drift }}
+        run: |
+          set -euo pipefail
+          if [[ "${NEW}" != "${OLD}" ]]; then
+            ACTION=release-tag
+            REF="v${NEW}"
+            DESC="上游 ${OLD} -> ${NEW}：改版本引用 + 打标签 + 发布镜像"
+          elif [[ "${PUBLISHED}" == "false" ]]; then
+            ACTION=backfill
+            REF="v${OLD}"
+            DESC="ghcr 缺 ${OLD} 镜像：按已存在的标签重新发布"
+          elif [[ "${DRIFT}" == "true" ]]; then
+            ACTION=refresh
+            REF=main
+            DESC="镜像落后 main 的镜像相关改动：按 main 重新发布 ${OLD}"
+          else
+            ACTION=none
+            REF=""
+            DESC="已是最新，无需动作"
+          fi
+          echo "本轮动作：${ACTION}（${DESC}）"
+          {
+            echo "action=${ACTION}"
+            echo "ref=${REF}"
+            echo "desc=${DESC}"
+          } >> "$GITHUB_OUTPUT"
+
       - name: 更新版本引用并推送
-        if: steps.latest.outputs.version != steps.current.outputs.version
+        if: steps.plan.outputs.action == 'release-tag'
         env:
           OLD: ${{ steps.current.outputs.version }}
           NEW: ${{ steps.latest.outputs.version }}
@@ -196,7 +325,7 @@ jobs:
 
       - name: 创建版本标签
         id: tag
-        if: steps.latest.outputs.version != steps.current.outputs.version || steps.registry.outputs.published == 'false'
+        if: steps.plan.outputs.action == 'release-tag' || steps.plan.outputs.action == 'backfill'
         env:
           V: ${{ steps.latest.outputs.version }}
         run: |
@@ -212,13 +341,21 @@ jobs:
 
       - name: 触发镜像构建发布
         id: dispatch
-        if: steps.latest.outputs.version != steps.current.outputs.version || steps.registry.outputs.published == 'false'
+        if: steps.plan.outputs.action != 'none'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ steps.tag.outputs.tag }}
+          REF: ${{ steps.plan.outputs.ref }}
         run: |
           set -euo pipefail
-          URL="${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/docker-publish.yml/dispatches"
+          API="${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/docker-publish.yml"
+          # 派发前记下该 ref 上已有的最大 run id：204 只代表「请求被接受」，
+          # 必须看到 id 更大的运行记录才算真的建立。refresh 用的 ref=main 上本来就有
+          # 历史 run，没有基线就会把很久以前那一次当成本次结果。
+          BASELINE=$(curl -sS --retry 3 --retry-delay 5 -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" "${API}/runs?per_page=50" \
+              | jq -r --arg ref "${REF}" '[.workflow_runs[]? | select(.head_branch == $ref) | .id] | max // 0')
+          echo "ref=${REF} 上的基线 run id：${BASELINE:-0}"
+
           CODE=""
           # workflow_dispatch 是 GITHUB_TOKEN 触发级联的法定例外，可正常创建新 run；
           # 但令牌必须同时具备 actions: write（见文件顶部 permissions）。
@@ -227,7 +364,7 @@ jobs:
               -H "Authorization: Bearer ${GH_TOKEN}" \
               -H "Accept: application/vnd.github+json" \
               -H "X-GitHub-Api-Version: 2022-11-28" \
-              "$URL" -d "{\"ref\":\"${TAG}\"}") || CODE="000"
+              "${API}/dispatches" -d "{\"ref\":\"${REF}\"}") || CODE="000"
             if [[ "$CODE" == "204" ]]; then break; fi
             echo "第 ${attempt} 次派发失败（HTTP ${CODE})：$(cat /tmp/dispatch.body 2>/dev/null)"
             [[ "$attempt" -lt 3 ]] && sleep 10
@@ -236,24 +373,24 @@ jobs:
             echo "::error::派发镜像构建失败（HTTP ${CODE}）。403 通常表示 permissions 缺少 actions: write"
             exit 1
           fi
-          echo "已派发 docker-publish.yml @ ${TAG}（HTTP 204）"
+          echo "已派发 docker-publish.yml @ ${REF}（HTTP 204）"
+
           # 二次确认：接口返回 204 不等于 run 真的建立了，必须查到运行记录才算成功
           RUN_ID=""
-          for attempt in 1 2 3 4 5 6; do
+          for attempt in 1 2 3 4 5 6 7 8; do
             sleep 8
             RUNS=$(curl -sS --retry 3 --retry-delay 5 -H "Authorization: Bearer ${GH_TOKEN}" \
-              -H "Accept: application/vnd.github+json" \
-              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/docker-publish.yml/runs?per_page=20" || true)
-            RUN_ID=$(printf '%s' "${RUNS}" | jq -r --arg tag "$TAG" \
-              '[.workflow_runs[]? | select(.head_branch == $tag)] | max_by(.id) | .id // empty')
+              -H "Accept: application/vnd.github+json" "${API}/runs?per_page=50" || true)
+            RUN_ID=$(printf '%s' "${RUNS}" | jq -r --arg ref "${REF}" --argjson base "${BASELINE:-0}" \
+              '[.workflow_runs[]? | select(.head_branch == $ref) | select(.id > $base) | .id] | max // empty')
             [[ -n "${RUN_ID}" ]] && break
-            echo "第 ${attempt} 次查询未看到 ${TAG} 的构建记录，继续等待"
+            echo "第 ${attempt} 次查询未看到 ${REF} 的新构建记录，继续等待"
           done
           if [[ -z "${RUN_ID}" ]]; then
-            echo "::error::派发返回 204，但未查到 ${TAG} 的构建记录，镜像不会更新，需人工检查"
+            echo "::error::派发返回 204，但未查到 ${REF} 的新构建记录，镜像不会更新，需人工检查"
             exit 1
           fi
-          echo "已确认 ${TAG} 的构建记录存在（run ${RUN_ID}），镜像将自动更新"
+          echo "已确认 ${REF} 的构建记录存在（run ${RUN_ID}），镜像将自动更新"
           echo "run_id=${RUN_ID}" >> "$GITHUB_OUTPUT"
 
       - name: 等待镜像构建完成
@@ -297,6 +434,10 @@ jobs:
           OLD: ${{ steps.current.outputs.version }}
           NEW: ${{ steps.latest.outputs.version }}
           PUBLISHED: ${{ steps.registry.outputs.published }}
+          DRIFT: ${{ steps.drift.outputs.drift }}
+          DRIFT_REASON: ${{ steps.drift.outputs.reason }}
+          ACTION: ${{ steps.plan.outputs.action }}
+          REF: ${{ steps.plan.outputs.ref }}
           DISPATCH: ${{ steps.dispatch.outcome }}
           BUILD: ${{ steps.wait_build.outcome }}
         run: |
@@ -312,26 +453,22 @@ jobs:
               false)   echo "| ghcr 对账 | **缺少 ${OLD} 镜像，已安排重建** |" ;;
               *)       echo "| ghcr 对账 | 查询失败，本轮跳过（${PUBLISHED:-unknown}） |" ;;
             esac
-            if [[ -n "${NEW}" && "${NEW}" != "${OLD}" ]]; then
-              echo "| 代码与标签 | 已更新版本引用并创建 refs/tags/v${NEW} |"
-              if [[ "${DISPATCH}" != "success" ]]; then
-                echo "| 镜像构建 | **派发失败（${DISPATCH:-unknown}），ghcr 镜像不会更新，需人工处理** |"
-              elif [[ "${BUILD}" == "success" ]]; then
-                echo "| 镜像构建 | 已成功发布（ghcr 标签：latest + ${NEW}） |"
-              elif [[ "${BUILD}" == "failure" ]]; then
-                echo "| 镜像构建 | **构建失败，ghcr 镜像仍为旧版，需人工处理** |"
-              else
-                echo "| 镜像构建 | 派发成功但未确认结果（${BUILD:-unknown}） |"
-              fi
-            elif [[ "${PUBLISHED}" == "false" ]]; then
-              if [[ "${BUILD}" == "success" ]]; then
-                echo "| 镜像构建 | 已补齐缺失镜像（版本未变，无代码改动） |"
-              elif [[ "${BUILD}" == "failure" ]]; then
-                echo "| 镜像构建 | **补齐失败，需人工处理** |"
-              else
-                echo "| 镜像构建 | 已派发补齐，结果未确认（${BUILD:-unknown}） |"
-              fi
+            case "${DRIFT}" in
+              true)    echo "| 源码漂移 | **镜像落后 main（${DRIFT_REASON:-source-drift}），已安排重新发布** |" ;;
+              false)   echo "| 源码漂移 | 无（镜像就是 main 的镜像相关代码） |" ;;
+              "")      echo "| 源码漂移 | 本轮未判定（版本变更或镜像缺失优先处理） |" ;;
+              *)       echo "| 源码漂移 | 无法判定（${DRIFT}），本轮跳过 |" ;;
+            esac
+            echo "| 本轮动作 | ${ACTION:-unknown} ${REF:+(${REF})} |"
+            if [[ "${ACTION}" == "none" || -z "${ACTION}" ]]; then
+              echo "| 镜像构建 | 未触发 |"
+            elif [[ "${DISPATCH}" != "success" ]]; then
+              echo "| 镜像构建 | **派发失败（${DISPATCH:-unknown}），ghcr 镜像不会更新，需人工处理** |"
+            elif [[ "${BUILD}" == "success" ]]; then
+              echo "| 镜像构建 | 已成功发布（ghcr 标签：latest + ${NEW}） |"
+            elif [[ "${BUILD}" == "failure" ]]; then
+              echo "| 镜像构建 | **构建失败，ghcr 镜像仍为旧版，需人工处理** |"
             else
-              echo "| 操作 | 已是最新，无需更新 |"
+              echo "| 镜像构建 | 派发成功但未确认结果（${BUILD:-unknown}） |"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
