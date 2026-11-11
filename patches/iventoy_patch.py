@@ -8,8 +8,12 @@ the ELF symbol table and on instruction signatures inside the named functions:
   * g_aucRecordMac (+6-byte records) -> relocated into fresh .bss pages and
                                         every instruction referencing it rewritten
   * dhcp_read_callback_normal/_proxy -> ARM64 / LoongArch reject branches removed
-  * main_start / http_init /
-    http_master_thread_main          -> self-checksum handling neutralised
+  * main_start                       -> the tarfs expected-checksum is overwritten
+                                        with the real hash of the patched exe, so
+                                        every later self-check compares equal
+                                        without being faked. (Faking only the
+                                        compare leaves the two hashes divergent,
+                                        and iVentoy then serves an empty WebUI.)
 
 Each site is verified before it is written. If a signature is not found the
 script prints the function, the expected pattern and the first bytes of the
@@ -414,112 +418,84 @@ class Patcher:
                     out.append((base + j, body[j:j + 4], NOP_ARM))
         return out
 
-    # ------------------------------------------------------------ 4. self-checks
-    def patch_checks(self):
-        self._patch_main_start()
-        self._patch_http_init()
-        self._patch_master_thread()
-
-    def _patch_main_start(self):
+    # ------------------------------------------------------- 4. hash self-binding
+    #
+    # 启动时 iVentoy 把 exe 的 SHA-256 与 tarfs 里 /sha256/<type>.txt 的期望值比对，
+    # 并把两个哈希都写进工作配置（cfg+0xc 与 cfg+0x4c）。这两份值不相等时它不报错、
+    # 也不退出，而是静默降级：WebUI 返回 200 但正文只有 1 字节（全白页），
+    # 因为 tarfs 里的 www 资源用这对哈希做一致性判据。
+    #
+    # 早期做法是「让比较结果等于 0」（三处：main_start / http_init / http_master_thread_main），
+    # 结果 exe 的实算哈希与期望值永远不等 —— 网页全白。正确做法是让期望值变成真的：
+    # 把实算哈希抄进 tarfs 的期望值缓冲区。这里正好复用原本要调 g_ascii_strncasecmp 的
+    # 那条 call —— 它的参数寄存器/顺序与 memcpy(dst=期望值, src=实算值, 0x40) 完全一致，
+    # 于是后面所有比对都自然成立，一处也不用伪造。
+    def patch_hash_bind(self):
         va, _s, body = self.body("main_start")
         if self.x86:
-            want = self.elf.plt("g_ascii_strncasecmp")
-            for i in range(len(body) - 10):
-                if body[i] != 0xE8:
-                    continue
-                rel = struct.unpack_from("<i", body, i + 1)[0]
-                if want is not None and va + i + 5 + rel != want:
-                    continue
-                if body[i + 5:i + 9] == b"\x85\xc0\x89\xc3":    # test eax,eax; mov ebx,eax
-                    self.write(va + i + 5, b"\x85\xc0", b"\x31\xc0",
-                               "main_start", "compare forced equal")
-                    return
-            self.fail("main_start", "call g_ascii_strncasecmp + compare not found", va)
+            self._bind_hash_x86(va, body)
         else:
-            want = self.elf.plt("g_ascii_strncasecmp")
-            for i in range(0, len(body) - 8, 4):
-                w = struct.unpack_from("<I", body, i)[0]
-                if (w & 0xFC000000) != 0x94000000:               # bl
-                    continue
-                imm = w & 0x3FFFFFF
-                if imm & (1 << 25):
-                    imm -= 1 << 26
-                if want is None or va + i + (imm << 2) != want:
-                    continue                                     # not the strncasecmp call
-                nxt = struct.unpack_from("<I", body, i + 4)[0]
-                if (nxt & 0x7E000000) in (0x34000000, 0x35000000):
-                    rt = nxt & 31
-                    self.write(va + i + 4, body[i + 4:i + 8],
-                               struct.pack("<I", 0x52800000 | rt),
-                               "main_start", f"cbnz -> mov w{rt},#0")
-                    return
-            self.fail("main_start", "bl g_ascii_strncasecmp + cbz not found", va)
+            self._bind_hash_arm64(va, body)
 
-    def _patch_http_init(self):
-        va, _s, body = self.body("http_init")
-        if self.x86:
-            cands = [i for i in range(len(body) - 4) if body[i:i + 3] == b"\x48\x0f\x45"]
-            for i in reversed(cands):
-                # the real site is the one whose result is tested right afte
-                # (test r64, r64 -> "if (matched == 0)"), so a future build with
-                # several cmovne cannot be patched at the wrong one silently
-                if b"\x48\x85" in body[i + 4:i + 24]:
-                    self.write(va + i, body[i:i + 4], NOP_X86 * 4, "http_init",
-                               "check result pinned to 1")
-                    return
-            self.fail("http_init",
-                      f"{len(cands)} cmovne found, none followed by test/je", va)
-        else:
-            for i in range(0, len(body) - 20, 4):
-                w = struct.unpack_from("<I", body, i)[0]
-                if not ((w & 0xFFE0F000) == 0x9A800000 and ((w >> 16) & 31) == 31
-                        and ((w >> 12) & 15) == 0):              # csel xD, xD, xzr, eq
-                    continue
-                rd = w & 31
-                guarded = False
-                for j in range(i + 4, i + 20, 4):                # must be followed by cbz xD
-                    nxt = struct.unpack_from("<I", body, j)[0]
-                    if (nxt & 0x7F000000) == 0x34000000 and (nxt & 31) == rd:
-                        guarded = True
-                        break
-                if not guarded:
-                    continue
-                self.write(va + i, body[i:i + 4],
-                           struct.pack("<I", 0xD2800000 | (1 << 5) | rd),
-                           "http_init", f"csel -> mov x{rd},#1")
-                return
-            self.fail("http_init", "csel xD,xD,xzr,eq not found", va)
+    def _bind_hash_x86(self, va, body):
+        want = self.elf.plt("g_ascii_strncasecmp")
+        copy = self.elf.plt("memcpy") or self.elf.plt("memmove")
+        if want is None or copy is None:
+            self.fail("main_start", "g_ascii_strncasecmp / memcpy missing from PLT", va)
+            return
+        for i in range(3, len(body) - 15):
+            if body[i] != 0xE8:
+                continue
+            rel = struct.unpack_from("<i", body, i + 1)[0]
+            if va + i + 5 + rel != want:
+                continue
+            # 取参形态：mov edx,0x40 / mov rsi,computed / mov rax,rdi(=tarfs)
+            if body[i - 3:i] != b"\x48\x89\xc7":
+                continue
+            # 紧跟着 test eax,eax / mov ebx,eax / jne mismatch
+            if body[i + 5:i + 11] != b"\x85\xc0\x89\xc3\x0f\x85":
+                continue
+            new_rel = copy - (va + i + 5)
+            self.write(va + i, b"\xe8" + struct.pack("<i", rel),
+                       b"\xe8" + struct.pack("<i", new_rel),
+                       "main_start", "compare call -> memcpy(expected, computed, 0x40)")
+            self.write(va + i + 7, b"\x89\xc3", b"\x31\xdb",
+                       "main_start", "status dword zeroed (memcpy returns non-zero)")
+            self.write(va + i + 9, body[i + 9:i + 15], NOP_X86 * 6,
+                       "main_start", "jne mismatch -> nop (expected == computed now)")
+            return
+        self.fail("main_start", "hash compare call site not found", va)
 
-    def _patch_master_thread(self):
-        va, _s, body = self.body("http_master_thread_main")
-        if self.x86:
-            k = body.find(b"\x41\xbf\x65\x90\xff\xff")           # mov r15d,0xffff9065 (26000)
-            if k < 0:
-                self.fail("http_master_thread_main", "API port constant not found", va)
-                return
-            for j in range(max(k - 32, 0), min(k + 48, len(body) - 3)):
-                if body[j:j + 3] == b"\x38\x45\x0c":             # cmp [rbp+0xc], al
-                    self.write(va + j, body[j:j + 3], b"\x38\xc0\x90",
-                               "http_master_thread_main", "cfg compare forced equal")
-                    return
-            self.fail("http_master_thread_main", "cfg byte compare not found", va)
-        else:
-            for i in range(0, len(body) - 20, 4):
-                w1 = struct.unpack_from("<I", body, i)[0]
-                if (w1 & 0xFFC00000) != 0x39400000 or ((w1 >> 10) & 0xFFF) != 12:
-                    continue                                     # ldrb w?, [x?, #12]
-                rn = (w1 >> 5) & 31
-                w2 = struct.unpack_from("<I", body, i + 4)[0]
-                if (w2 & 0xFFC00000) != 0x39400000 or ((w2 >> 10) & 0xFFF) != 76 \
-                        or ((w2 >> 5) & 31) != rn:
-                    continue                                     # ldrb w?, [x?, #76]
-                for j in range(i + 8, i + 24, 4):
-                    wj = struct.unpack_from("<I", body, j)[0]
-                    if (wj & 0xFF00000F) == 0x54000001:          # b.ne
-                        self.write(va + j, body[j:j + 4], NOP_ARM,
-                                   "http_master_thread_main", "b.ne -> nop (force 26000)")
-                        return
-            self.fail("http_master_thread_main", "cfg byte compare not found", va)
+    def _bind_hash_arm64(self, va, body):
+        want = self.elf.plt("g_ascii_strncasecmp")
+        copy = self.elf.plt("memcpy") or self.elf.plt("memmove")
+        if want is None or copy is None:
+            self.fail("main_start", "g_ascii_strncasecmp / memcpy missing from PLT", va)
+            return
+        for i in range(4, len(body) - 8, 4):
+            w = struct.unpack_from("<I", body, i)[0]
+            if (w & 0xFC000000) != 0x94000000:                   # bl
+                continue
+            imm = w & 0x3FFFFFF
+            if imm & (1 << 25):
+                imm -= 1 << 26
+            if va + i + (imm << 2) != want:
+                continue
+            prev = struct.unpack_from("<I", body, i - 4)[0]
+            if (prev & 0xFFE0FFFF) != 0xAA0003E1:                # mov x1, xN（源）
+                continue
+            nxt = struct.unpack_from("<I", body, i + 4)[0]
+            if (nxt & 0x7E000000) not in (0x34000000, 0x35000000):
+                continue                                         # cbz / cbnz
+            rt = nxt & 31
+            new_w = 0x94000000 | (((copy - (va + i)) >> 2) & 0x3FFFFFF)
+            self.write(va + i, body[i:i + 4], struct.pack("<I", new_w),
+                       "main_start", "bl compare -> bl memcpy(expected, computed, 0x40)")
+            self.write(va + i + 4, body[i + 4:i + 8],
+                       struct.pack("<I", 0x52800000 | rt),
+                       "main_start", f"cbz w{rt} -> mov w{rt},#0")
+            return
+        self.fail("main_start", "hash compare bl site not found", va)
 
 
 def verify_patched(binary: str, report_path: str) -> int:
@@ -598,7 +574,7 @@ def main() -> int:
     p.patch_limit()
     p.patch_array()
     p.patch_arch_gates()
-    p.patch_checks()
+    p.patch_hash_bind()
 
     report = {
         "binary": str(args.binary),
