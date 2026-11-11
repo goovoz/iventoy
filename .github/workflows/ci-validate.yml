@@ -63,6 +63,15 @@ jobs:
       - name: Container entrypoint self-test
         run: sh tests/test-container-entrypoint.sh
 
+      # [iventoy-fork] 补丁里的 Python 与那段要被注入的 C，语法级先过一遍：
+      # 它们只在镜像构建时才真正跑，坏了要等发版才发现。
+      - name: Python 语法 + C 语法（补丁工具）
+        run: |
+          set -euo pipefail
+          for f in patches/*.py; do python3 -m py_compile "$f"; done
+          gcc -fsyntax-only -ffreestanding -fno-builtin -fno-pic -Wall -Wextra \
+            patches/matrix_boot_add.c
+
   # [iventoy-fork] 补丁签名闸：补丁按符号名 + 指令签名定位，上游一改版就可能失配。
   # 这里在 push/PR 阶段就拿当前固定版本跑 --check，失配立即红，不用等发版那一刻。
   patch:
@@ -99,6 +108,8 @@ jobs:
             [ -n "$src" ] || src="${dir}/iventoy"
             echo "--- ${arch}: ${src} ---"
             python3 patches/iventoy_patch.py --check "${src}/lib/iventoy" || rc=1
+            # 分机独启钩子：符号/桩形态/落点是否还能对上（不上编译器、不写文件）
+            python3 patches/matrix_boot_hook.py --check "${src}/lib/iventoy" || rc=1
           done
           if [ "$rc" -ne 0 ]; then
             echo "::error::补丁签名与 v${V} 不再匹配，需要重新锚定（见 patches/README.md）"
