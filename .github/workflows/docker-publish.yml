@@ -319,3 +319,19 @@ jobs:
             docker rm -f "$name" >/dev/null 2>&1 || true
           done
           exit $rc
+
+      # [iventoy-fork] 冒烟只能证明「容器起得来」，证明不了「镜像里那份二进制是打过补丁的」。
+      # 这里把镜像里的 lib/iventoy 和构建期写的 patch.json 一起拉出来，
+      # 用补丁脚本的 --verify 逐站点对字节：任何一处被跳过 / 被回滚都会红。
+      - name: 校验镜像内二进制与补丁报告一致
+        env:
+          IMAGE: ${{ steps.version.outputs.iventoy_version }}
+          SMOKE_REGISTRY: ${{ steps.targets.outputs.ghcr == 'true' && format('ghcr.io/{0}', github.repository_owner) || secrets.DOCKERHUB_USERNAME }}
+        run: |
+          set -euo pipefail
+          IMG="${SMOKE_REGISTRY}/${REGISTRY_IMAGE}:${IMAGE}"
+          docker pull --quiet "$IMG" >/dev/null
+          docker run --rm --entrypoint cat "$IMG" /iventoy/lib/iventoy > /tmp/shipped.bin
+          docker run --rm --entrypoint cat "$IMG" /usr/share/iventoy/patch.json > /tmp/shipped.json
+          ls -l /tmp/shipped.bin /tmp/shipped.json
+          python3 patches/iventoy_patch.py --verify /tmp/shipped.json /tmp/shipped.bin

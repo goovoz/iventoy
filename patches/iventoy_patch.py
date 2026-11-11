@@ -213,7 +213,18 @@ class Patcher:
             self.fail("g_aucRecordMac", "no instruction referencing it was found")
             return
         for va, old, new, desc in refs:
+            if new is None:
+                self.fail("g_aucRecordMac", f"0x{va:X}: unsupported addressing form ({desc})", va)
+                continue
             self.write(va, old, new, "g_aucRecordMac", desc)
+
+        # anything still pointing at the old array means an addressing form this
+        # script does not rewrite - fail instead of shipping a half-moved array
+        leftover = self._array_refs(a_va, new_base)
+        if leftover:
+            self.fail("g_aucRecordMac", "%d reference(s) still point at 0x%X: %s"
+                      % (len(leftover), a_va,
+                         ", ".join("0x%X" % v for v, *_ in leftover[:8])))
 
         struct.pack_into("<Q", self.data, phdr + 0x28, new_memsz)
         self.applied.append({"site": "PT_LOAD.p_memsz", "va": f"0x{seg_va:X}",
@@ -267,30 +278,48 @@ class Patcher:
                 words[i] = struct.unpack_from("<I", d, t_off + i)[0]
             for i in range(0, t_size - 8, 4):
                 w = words[i]
+                # movz + movk pair that materialises the address (non-PIE build, so
+                # the absolute address fits in two 16-bit halves)
+                if (w & 0xFF800000) == 0xD2800000:
+                    rd = w & 31
+                    nxt = words.get(i + 4)
+                    if nxt is not None and (nxt & 0xFF800000) == 0xF2800000 and (nxt & 31) == rd:
+                        val = ((w >> 5) & 0xFFFF) | (((nxt >> 5) & 0xFFFF) << 16)
+                        if val == a_va:
+                            nw1 = 0xD2800000 | ((new_base & 0xFFFF) << 5) | rd
+                            nw2 = 0xF2800000 | (((new_base >> 16) & 0xFFFF) << 5) | rd
+                            out.append((t_va + i, d[t_off + i:t_off + i + 4],
+                                        struct.pack("<I", nw1), "movz -> new base"))
+                            out.append((t_va + i + 4, d[t_off + i + 4:t_off + i + 8],
+                                        struct.pack("<I", nw2), "movk -> new base"))
+                    continue
                 if (w & 0x9F000000) != 0x90000000:         # adrp
                     continue
                 rd = w & 31
                 page = self._adrp_page(t_va + i, w)
-                for j in range(i + 4, i + 16, 4):
+                for j in range(i + 4, i + 20, 4):
                     if j not in words:
                         continue
                     nxt = words[j]
-                    if (nxt & 0xFF800000) != 0x91000000:   # add xD, xN, #imm
-                        continue
-                    if ((nxt >> 5) & 31) != rd:
-                        continue
-                    imm = (nxt >> 10) & 0xFFF
-                    rd2 = nxt & 31
-                    if page + imm != a_va:
-                        continue
-                    # rewrite adrp -> new page, add -> #0
-                    nw_adrp = self._adrp_encode(t_va + i, new_base, rd)
-                    nw_add = 0x91000000 | (rd << 5) | rd2        # add xD, xN, #0
-                    out.append((t_va + i, d[t_off + i:t_off + i + 4],
-                                struct.pack("<I", nw_adrp), "adrp -> new page"))
-                    out.append((t_va + j, d[t_off + j:t_off + j + 4],
-                                struct.pack("<I", nw_add), "add #0"))
-                    break
+                    if (nxt & 0xFF800000) == 0x91000000 and ((nxt >> 5) & 31) == rd:
+                        imm = (nxt >> 10) & 0xFFF
+                        if page + imm == a_va:
+                            # rewrite adrp -> new page, add -> #0
+                            nw_adrp = self._adrp_encode(t_va + i, new_base, rd)
+                            nw_add = 0x91000000 | (rd << 5) | (nxt & 31)   # add xD, xN, #0
+                            out.append((t_va + i, d[t_off + i:t_off + i + 4],
+                                        struct.pack("<I", nw_adrp), "adrp -> new page"))
+                            out.append((t_va + j, d[t_off + j:t_off + j + 4],
+                                        struct.pack("<I", nw_add), "add #0"))
+                        break
+                    # adrp + ldr: the address would come from a literal slot, which
+                    # this script cannot retarget - report it instead of missing it
+                    if (nxt & 0xFFC00000) in (0xF9400000, 0xB9400000) and ((nxt >> 5) & 31) == rd:
+                        scale = 8 if (nxt >> 30) & 1 else 4
+                        if page + ((nxt >> 10) & 0xFFF) * scale == a_va:
+                            out.append((t_va + i, d[t_off + i:t_off + i + 4], None,
+                                        "adrp+ldr literal load"))
+                        break
         # a 66/48 prefixed instruction also matches the unprefixed pattern one byte
         # later - keep the earliest (longest) match and drop the overlapping one
         out.sort(key=lambda x: x[0])
@@ -429,12 +458,17 @@ class Patcher:
     def _patch_http_init(self):
         va, _s, body = self.body("http_init")
         if self.x86:
-            for i in range(len(body) - 4):
-                if body[i:i + 3] == b"\x48\x0f\x45":             # cmovne r64,r64
+            cands = [i for i in range(len(body) - 4) if body[i:i + 3] == b"\x48\x0f\x45"]
+            for i in reversed(cands):
+                # the real site is the one whose result is tested right afte
+                # (test r64, r64 -> "if (matched == 0)"), so a future build with
+                # several cmovne cannot be patched at the wrong one silently
+                if b"\x48\x85" in body[i + 4:i + 24]:
                     self.write(va + i, body[i:i + 4], NOP_X86 * 4, "http_init",
                                "check result pinned to 1")
                     return
-            self.fail("http_init", "cmovne not found", va)
+            self.fail("http_init",
+                      f"{len(cands)} cmovne found, none followed by test/je", va)
         else:
             for i in range(0, len(body) - 20, 4):
                 w = struct.unpack_from("<I", body, i)[0]
@@ -488,13 +522,68 @@ class Patcher:
             self.fail("http_master_thread_main", "cfg byte compare not found", va)
 
 
+def verify_patched(binary: str, report_path: str) -> int:
+    """Re-check a shipped binary against the report produced when it was patched.
+
+    This is what CI runs on the artifact pulled out of the built image: it proves
+    the image really carries the patched binary, not just that a report exists.
+    """
+    rep = json.loads(Path(report_path).read_text(encoding="utf-8"))
+    data = Path(binary).read_bytes()
+    sha = hashlib.sha256(data).hexdigest()
+    if sha != rep.get("output_sha256"):
+        print(f"FAIL: {binary} sha256 {sha} != report output_sha256 "
+              f"{rep.get('output_sha256')}", file=sys.stderr)
+        return 2
+    if not rep.get("ok"):
+        print("FAIL: report says ok=false", file=sys.stderr)
+        return 2
+
+    elf = ELF(data)
+    bad = 0
+    for site in rep.get("applied", []):
+        name = site["site"]
+        if name == "PT_LOAD.p_memsz":
+            continue
+        va = int(site["va"], 16)
+        want = bytes.fromhex(site["new"])
+        try:
+            off = elf.off(va)
+        except SystemExit:
+            print(f"FAIL {name} 0x{va:X}: not file backed", file=sys.stderr)
+            bad += 1
+            continue
+        got = data[off:off + len(want)]
+        if got != want:
+            print(f"FAIL {name} 0x{va:X}: {got.hex()} != {want.hex()}", file=sys.stderr)
+            bad += 1
+
+    _po, seg_va, _pf, seg_memsz, _fl, _ph = elf.last_rw_load()
+    declared = [s for s in rep.get("applied", []) if s["site"] == "PT_LOAD.p_memsz"]
+    if declared and int(declared[0]["new"], 16) != seg_memsz:
+        print(f"FAIL PT_LOAD.p_memsz: 0x{seg_memsz:X} != {declared[0]['new']}", file=sys.stderr)
+        bad += 1
+
+    if bad:
+        print(f"FAILED: {bad} site(s) do not match the patch report", file=sys.stderr)
+        return 2
+    print(f"OK: {len(rep.get('applied', []))} sites match the report, "
+          f"max_clients={rep.get('max_clients')}, arch={rep.get('arch')}")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("binary")
     ap.add_argument("--max-clients", type=int, default=65535)
     ap.add_argument("--check", action="store_true", help="report only, write nothing")
     ap.add_argument("--report", help="write a JSON report to this path")
+    ap.add_argument("--verify", metavar="REPORT",
+                    help="verify an already patched binary against this report")
     args = ap.parse_args()
+
+    if args.verify:
+        return verify_patched(args.binary, args.verify)
 
     if not 1 <= args.max_clients <= MAX_CLIENTS_LIMIT:
         ap.error(f"--max-clients must be between 1 and {MAX_CLIENTS_LIMIT} "

@@ -71,6 +71,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: 缓存上游安装包
+        uses: actions/cache@v4
+        with:
+          path: /tmp/pt
+          # Dockerfile 里的版本号变了 key 就变，旧缓存自动失效
+          key: iventoy-assets-${{ hashFiles('Dockerfile') }}
+
       - name: 校验补丁签名（amd64 + arm64）
         run: |
           set -euo pipefail
@@ -84,7 +91,7 @@ jobs:
             f="iventoy-${V}-linux-${suffix}-${edition}.tar.gz"
             dir="/tmp/pt/${arch}"
             mkdir -p "$dir"
-            curl -fsSL --retry 3 --retry-delay 5 -o "/tmp/pt/${f}" \
+            [ -s "/tmp/pt/${f}" ] || curl -fsSL --retry 3 --retry-delay 5 -o "/tmp/pt/${f}" \
               "https://github.com/ventoy/PXE/releases/download/v${V}/${f}"
             tar -xzf "/tmp/pt/${f}" -C "$dir"
             # 上游包顶层目录名不一定叫 iventoy，按 Dockerfile 的同一套规则找
