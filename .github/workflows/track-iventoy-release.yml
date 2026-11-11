@@ -151,7 +151,7 @@ jobs:
               sleep 5
               continue
             fi
-            CODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 \
+            CODE=$(curl -sSL -o /dev/null -w '%{http_code}' --max-time 20 \
               -H "Authorization: Bearer ${TOKEN}" \
               -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json" \
               "https://ghcr.io/v2/${OWNER}/${PACKAGE}/manifests/${VERSION}") || CODE=000
@@ -214,13 +214,16 @@ jobs:
           fi
 
           ACCEPT="application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json"
-          MAN=$(curl -sS --max-time 30 -H "Authorization: Bearer ${TOKEN}" -H "Accept: ${ACCEPT}" \
+          # blobs 接口会 307 跳到对象存储，不带 -L 会拿到 0 字节 —— 实测过：
+          # curl -sS 返回空 body、退出码 0，后面 jq 解析失败只能记成 unknown，
+          # 漂移对账就等于永远不生效。manifest 也一并带 -L，免得将来被改成跳转又踩一次。
+          MAN=$(curl -sSL --max-time 30 -H "Authorization: Bearer ${TOKEN}" -H "Accept: ${ACCEPT}" \
             "https://ghcr.io/v2/${OWNER}/${PACKAGE}/manifests/${VERSION}") || MAN=""
           # 多架构索引：先定位 linux/amd64 子清单，再取它的 config blob
           CHILD=$(printf '%s' "${MAN}" \
             | jq -r '[.manifests[]? | select(.platform.os == "linux" and .platform.architecture == "amd64") | .digest] | first // empty' 2>/dev/null)
           if [[ -n "${CHILD}" ]]; then
-            MAN=$(curl -sS --max-time 30 -H "Authorization: Bearer ${TOKEN}" -H "Accept: ${ACCEPT}" \
+            MAN=$(curl -sSL --max-time 30 -H "Authorization: Bearer ${TOKEN}" -H "Accept: ${ACCEPT}" \
               "https://ghcr.io/v2/${OWNER}/${PACKAGE}/manifests/${CHILD}") || MAN=""
           fi
           CFG=$(printf '%s' "${MAN}" | jq -r '.config.digest // empty' 2>/dev/null)
@@ -229,7 +232,7 @@ jobs:
             echo "drift=unknown" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          REV=$(curl -sS --max-time 30 -H "Authorization: Bearer ${TOKEN}" \
+          REV=$(curl -sSL --max-time 30 -H "Authorization: Bearer ${TOKEN}" \
             "https://ghcr.io/v2/${OWNER}/${PACKAGE}/blobs/${CFG}" \
             | jq -r '.config.Labels["org.opencontainers.image.revision"] // empty' 2>/dev/null) || REV=""
           if [[ -z "${REV}" ]]; then
