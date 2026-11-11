@@ -73,10 +73,10 @@ iVentoy 官方发布源：[ventoy/PXE releases](https://github.com/ventoy/PXE/re
   `latest` 只在「tag 版本 == Dockerfile 默认版本」或非 tag 触发（dispatch / `main` 推送）时更新，
   推一个旧 tag 不会把 `latest` 回退到旧版本
 - **每次 `main` 提交都重新发布并强制覆盖** `latest` / 版本号：镜像必须跟着代码走，
-  不另开旁路 tag。为了不把坏镜像怼到 `latest` 上，发布是两段的 ——
-  先按 digest 推一份无 tag 的构建产物，漏洞扫描 / 两架构冒烟 / 补丁 `--verify` 全过之后，
-  才用 `docker buildx imagetools create` 把 `latest` / 版本号指到这个 digest
-  （跨 registry 的 Docker Hub 也从同一个 digest 复制，两边字节一致）
+  不另开旁路 tag。覆盖是有兜底的 —— 构建前先把每个 tag 当前指向的 digest 记下来
+  （`docker buildx imagetools inspect`），后面的漏洞扫描 / 两架构冒烟 / 补丁 `--verify`
+  只要有一项不过，就用 `docker buildx imagetools create` 把 tag 指回旧 digest，然后让 run 变红。
+  所以最终状态只有两种：新镜像 + 绿，或旧镜像 + 红，不会停在「新的坏镜像 + 绿」
 - 同一 ref 的构建串行执行，且**不 cancel-in-progress**：一次运行的最后一步是移动 tag，
   半途取消可能只移动了一部分（`latest` 走了、版本号没走）。连续推送就排队
 - tracker 的版本 bump 提交（`chore: auto-update iVentoy ...`）跳过发布构建：

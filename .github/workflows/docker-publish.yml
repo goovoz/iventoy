@@ -29,12 +29,10 @@ permissions:
 
 env:
   REGISTRY_IMAGE: iventoy
-  # 构建产物先以「仅 digest、无 tag」的形式推到这里，校验通过后才移动 tag。
-  GHCR_REPO: ghcr.io/${{ github.repository_owner }}/iventoy
 
-# 同一 ref 的构建串行执行。现在每次构建的最后一步都是强制移动 tag，
-# 所以**不做 cancel-in-progress**：半途取消可能只移动了一部分 tag（latest 走了、版本号没走）。
-# 连续推送就排队，宁可多跑一次也不留半新半旧的状态。
+# 同一 ref 的构建串行执行，避免两个构建并发抢推 latest / 同一个版本 tag。
+# 这里刻意不做 cancel-in-progress：一次运行的结尾会改写 tag，半途取消会留下
+# 「latest 走了、版本号没走」这类半新半旧的状态。连续推送就排队。
 concurrency:
   group: docker-publish-${{ github.ref }}
   cancel-in-progress: false
@@ -82,13 +80,13 @@ jobs:
           WANT: ${{ inputs.targets || 'both' }}
         run: |
           set -euo pipefail
+          GHCR_IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER}/${REGISTRY_IMAGE}"
           HUB_IMAGE="docker.io/${DOCKERHUB_USERNAME}/${REGISTRY_IMAGE}"
           HAVE_HUB=false
           if [[ -n "${DOCKERHUB_USERNAME}" && -n "${DOCKERHUB_TOKEN}" ]]; then
             HAVE_HUB=true
           fi
 
-          # 镜像清单（metadata 用的目标列表）
           IMAGES=""
           case "${WANT}" in
             both) WANT_HUB=$HAVE_HUB; WANT_GHCR=true ;;
@@ -107,13 +105,17 @@ jobs:
             echo "::notice::未配置 Docker Hub 凭据（或未选择），本次不推 Docker Hub"
           fi
           if [[ "${WANT_GHCR}" == "true" ]]; then
-            IMAGES="${IMAGES}${GHCR_REPO}"$'\n'
+            IMAGES="${IMAGES}${GHCR_IMAGE}"$'\n'
+            VERIFY_REPO="${GHCR_IMAGE}"
+          else
+            VERIFY_REPO="${HUB_IMAGE}"
           fi
 
           {
             echo "dockerhub=${WANT_HUB}"
             echo "ghcr=${WANT_GHCR}"
             echo "hub_image=${HUB_IMAGE}"
+            echo "verify_repo=${VERIFY_REPO}"
             echo "images<<EOF"
             printf '%s' "${IMAGES}"
             echo "EOF"
@@ -127,6 +129,7 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Login to GitHub Container Registry
+        if: steps.targets.outputs.ghcr == 'true'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -180,18 +183,39 @@ jobs:
             # 少了这行，发布出来的镜像只有 latest，Docker Hub 上会缺精确版本号，没法钉版本回滚。
             type=raw,value=${{ steps.version.outputs.iventoy_version }}
 
-      # [iventoy-fork L2] 构建产物**先不带 tag**，只按 digest 推上去：
-      # 下面的漏洞扫描 / 两架构冒烟 / 补丁产物校验全部针对这个 digest 跑，
-      # 全过了才把 latest / 版本号移过去（见最后的「发布标签」步骤）。
-      # 这样既满足「新构建强制覆盖」，又不会把坏镜像怼到 latest 上等人来发现。
-      - name: Build and push by digest
+      # [iventoy-fork L2] 覆盖前先把当前 tag 指向的 digest 记下来。
+      # 下面的校验只要有一项不过，就按这份记录把 tag 指回去 —— 这就是「强制覆盖」的兜底：
+      # 覆盖是强制的，但覆盖错了能自动退回。
+      - name: 记录现有 tag 的 digest（回滚用）
+        id: prev
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -uo pipefail
+          OUT="${RUNNER_TEMP}/prev-digests.tsv"
+          : > "${OUT}"
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            D=$(docker buildx imagetools inspect "$tag" 2>/dev/null \
+                | awk '/^Digest:/{print $2; exit}')
+            if [ -n "${D}" ]; then
+              printf '%s\t%s\n' "$tag" "${D}" >> "${OUT}"
+              echo "现有 ${tag} -> ${D}"
+            else
+              echo "现有 ${tag} -> <不存在，回滚时跳过>"
+            fi
+          done <<< "${TAGS}"
+          echo "记录条数：$(wc -l < "${OUT}")"
+
+      - name: Build and push（强制覆盖 latest / 版本号）
         id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
           platforms: linux/amd64,linux/arm64
-          outputs: type=image,name=${{ env.GHCR_REPO }},push-by-digest=true,name-canonical=true
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           # [iventoy-fork L1] 关闭 provenance/SBOM attestation：它们会在镜像 index 里
           # 额外产生 unknown/unknown 平台条目，污染平台清单。代价是失去 SLSA 证明。
@@ -205,33 +229,15 @@ jobs:
           cache-from: type=gha,scope=iventoy
           cache-to: type=gha,mode=max,scope=iventoy
 
-      - name: 断言构建 digest
-        env:
-          DIGEST: ${{ steps.build.outputs.digest }}
-        run: |
-          set -euo pipefail
-          if [[ ! "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "::error::拿不到构建产物 digest（'${DIGEST}'），后面所有校验和发布都无从进行"
-            exit 1
-          fi
-          echo "构建产物：${GHCR_REPO}@${DIGEST}"
-          {
-            echo "### 构建产物"
-            echo ""
-            echo "\`${GHCR_REPO}@${DIGEST}\`"
-            echo ""
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      # [iventoy-fork L1] 扫「这一份构建产物」。Docker Hub 自己也会扫，但它的计数口径和
-      # 阈值都不透明；这里用同一套 trivy 口径在流水线里留痕，并且 CRITICAL 直接失败。
+      # [iventoy-fork L1] 扫「真正发布出去的那个镜像」。Docker Hub 自己也会扫，但它的
+      # 计数口径和阈值都不透明；这里用同一套 trivy 口径在流水线里留痕，并且 CRITICAL 直接失败。
       # 只扫 amd64：OS 基础包两个架构同一来源，arch 差异不改变结论，省一半时间。
       - name: 漏洞扫描（trivy，CRITICAL 即失败）
         env:
           GH_TOKEN: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
-          DIGEST: ${{ steps.build.outputs.digest }}
+          IMG: ${{ steps.targets.outputs.verify_repo }}:${{ steps.version.outputs.iventoy_version }}
         run: |
           set -euo pipefail
-          IMG="${GHCR_REPO}@${DIGEST}"
           echo "扫描对象：${IMG}（amd64）"
           VER=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
               https://api.github.com/repos/aquasecurity/trivy/releases/latest | python3 -c 'import json,sys;print(json.load(sys.stdin)["tag_name"])')
@@ -278,18 +284,21 @@ jobs:
         uses: docker/setup-qemu-action@v3
 
       # [iventoy-fork L1] 镜像能不能真的跑起来，只有扫漏洞是看不出来的。
-      # 这里把构建产物按架构拉下来起一遍，确认 WebUI（26000）能应答。
+      # 这里把刚发布的镜像按架构拉下来起一遍，确认 WebUI（26000）能应答：
+      # 换底包 / 换上游版本这类改动，最先坏的就是「起不来」，而这个检查能当场抓住。
       # 两个架构串行跑（26000 只能占用一次）。
       - name: 冒烟：按架构起容器并确认 WebUI 应答
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
+          IMG: ${{ steps.targets.outputs.verify_repo }}:${{ steps.version.outputs.iventoy_version }}
         run: |
           set -euo pipefail
-          IMG="${GHCR_REPO}@${DIGEST}"
           rc=0
           for arch in amd64 arm64; do
             name="iv-smoke-${arch}"
             docker rm -f "$name" >/dev/null 2>&1 || true
+            # 先删掉上一个架构残留的本地镜像：否则 docker 可能直接复用本地那份，
+            # 拉到的就不是目标架构（表现就是 exec format error）
+            docker rmi -f "${IMG}" >/dev/null 2>&1 || true
             echo "--- ${arch}: 拉取并运行 ${IMG} ---"
             if ! docker pull --quiet --platform "linux/${arch}" "${IMG}" >/dev/null; then
               echo "::error::${arch} 拉取失败"; rc=1; continue
@@ -337,52 +346,55 @@ jobs:
       # 用补丁脚本的 --verify 逐站点对字节：任何一处被跳过 / 被回滚都会红。
       - name: 校验镜像内二进制与补丁报告一致
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
+          IMG: ${{ steps.targets.outputs.verify_repo }}:${{ steps.version.outputs.iventoy_version }}
         run: |
           set -euo pipefail
-          IMG="${GHCR_REPO}@${DIGEST}"
-          docker pull --quiet "$IMG" >/dev/null
+          docker pull --quiet "${IMG}" >/dev/null
           docker run --rm --entrypoint cat "$IMG" /iventoy/lib/iventoy > /tmp/shipped.bin
           docker run --rm --entrypoint cat "$IMG" /usr/share/iventoy/patch.json > /tmp/shipped.json
           ls -l /tmp/shipped.bin /tmp/shipped.json
           python3 patches/iventoy_patch.py --verify /tmp/shipped.json /tmp/shipped.bin
 
-      # [iventoy-fork L2] 校验全过才移动 tag —— 这一步就是「强制覆盖」：
-      # 同一个 latest / 版本号被指到新 digest 上，旧 tag 同时失效。
-      # 跨 registry（Docker Hub）也从同一个 digest 复制，保证两边字节一致。
-      - name: 发布标签（latest / 版本号强制覆盖）
+      # [iventoy-fork L2] 上面任何一步红了，就把 tag 指回覆盖之前记下的 digest。
+      # 失败点可能在构建之后也可能在构建之前，两种情况都安全：
+      # 前者把坏镜像撤下来，后者把 tag 指回它本来就指向的地方。
+      - name: 回滚 tag（校验失败时）
+        if: failure()
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
-          TAGS: ${{ steps.meta.outputs.tags }}
+          GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/${{ env.REGISTRY_IMAGE }}
         run: |
-          set -euo pipefail
-          if [[ -z "${TAGS}" ]]; then
-            echo "::error::metadata 没产出任何 tag，终止"
-            exit 1
+          set -uo pipefail
+          F="${RUNNER_TEMP}/prev-digests.tsv"
+          if [ ! -s "$F" ]; then
+            echo "没有记录到旧的 tag digest，无可回滚（首次发布 / 记录步未执行）"
+            exit 0
           fi
-          while IFS= read -r tag; do
-            [ -n "$tag" ] || continue
-            echo "--- ${tag} <- ${GHCR_REPO}@${DIGEST} ---"
-            docker buildx imagetools create -t "$tag" "${GHCR_REPO}@${DIGEST}"
-          done <<< "${TAGS}"
-          echo '--- 发布结果 ---'
-          while IFS= read -r tag; do
-            [ -n "$tag" ] || continue
-            docker buildx imagetools inspect "$tag" | head -6
-          done <<< "${TAGS}"
+          rc=0
+          while IFS=$'\t' read -r tag digest; do
+            [ -n "${tag}" ] || continue
+            repo="${tag%:*}"
+            echo "回滚 ${tag} -> ${digest}"
+            if docker buildx imagetools create -t "${tag}" "${repo}@${digest}"; then
+              echo "  已回滚"
+            else
+              echo "::error::回滚 ${tag} 失败（${repo}@${digest}）"
+              rc=1
+            fi
+          done < "$F"
           {
-            echo "### 已发布标签"
+            echo "### 回滚"
             echo ""
             echo '```'
-            printf '%s\n' "${TAGS}"
+            cat "$F"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+          exit $rc
 
-      # [iventoy-fork L1] tag 移动成功后把 DOCKERHUB.md 同步成 Docker Hub 的说明页
+      # [iventoy-fork L1] 发布成功后把 DOCKERHUB.md 同步成 Docker Hub 的说明页
       # （短描述 + 正文 README）。只在「更新 latest」的那次同步，避免旧 tag 重建时
       # 把页面改回旧文档；失败只告警、不拦发布（文档不同步不该让镜像发布变红）。
       - name: Sync Docker Hub page
-        if: steps.targets.outputs.dockerhub == 'true' && steps.version.outputs.is_default == 'true'
+        if: success() && steps.targets.outputs.dockerhub == 'true' && steps.version.outputs.is_default == 'true'
         continue-on-error: true
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
