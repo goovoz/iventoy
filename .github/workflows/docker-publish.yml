@@ -322,7 +322,16 @@ jobs:
               [ "$code" = "200" ] && break
             done
             if [ "$code" = "200" ]; then
-              echo "  ${arch} WebUI -> HTTP 200（$(wc -c < /tmp/smoke.html) 字节）"
+              # [iventoy-fork L2] 只看 200 是不够的：补丁把 WebUI 打坏时，服务照样返回
+              # 200，正文只有 1 字节（浏览器一片全白）。2026-11-11 那次就是这个形态，
+              # 冒烟全绿、镜像发出去、用户打开是白页。这里改成断言页面真的是一份 HTML。
+              bytes=$(wc -c < /tmp/smoke.html)
+              echo "  ${arch} WebUI -> HTTP 200（${bytes} 字节）"
+              if [ "${bytes}" -lt 20000 ] || ! grep -qi '<html' /tmp/smoke.html; then
+                echo "::error::${arch} WebUI 正文异常（${bytes} 字节，不含 <html>）：服务起来了但页面是空的"
+                head -c 200 /tmp/smoke.html | sed 's/^/    /'
+                rc=1
+              fi
               # [iventoy-fork] 顺手确认补丁真的在镜像里：patch.json 缺失或 ok!=true，
               # 说明构建期补丁被跳过 / 失败被吞，WebUI 也可能是带着随机端口的假活。
               if ! docker run --rm --platform "linux/${arch}" --entrypoint /bin/sh "$IMG" \
