@@ -7,6 +7,7 @@
 .github/fork-paths.txt
 docs/UPSTREAM-SYNC.md
 .dockerignore
+.gitignore
 tests/test-container-entrypoint.sh
 .github/workflows/cleanup-dockerhub.yml
 .github/scripts/prune-dockerhub-tags.py
