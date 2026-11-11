@@ -62,6 +62,28 @@ RUN python3 /patches/iventoy_patch.py --max-clients "${IVENTOY_MAX_CLIENTS}" \
         --report /iventoy-patch.json /iventoy/lib/iventoy && \
     cat /iventoy-patch.json
 
+# [iventoy-fork L2] 「分机独启」(matrix boot) 在免费版里被裁成了桩：add 接口直接回
+# {"result":"notsupport"}，数据层的 toy_matrix_boot_add 也是 return -22。
+# 这里把 add 这条通路补回来（list/del/save/proc 本来就在）。
+#
+# 为什么单独一个阶段、而且跑在 TARGETPLATFORM 上：补丁本身是纯字节改写（python 就够），
+# 但这段补齐要**编译**一小段机器码，需要目标架构的编译器。放在目标平台阶段里用本机 gcc
+# 最省事（arm64 在 qemu 下跑，多花一分钟），不用在 x86 阶段里塞交叉工具链。
+FROM --platform=$TARGETPLATFORM debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad AS mbhook
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc libc6-dev python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=patch /iventoy /iventoy
+COPY --from=patch /iventoy-patch.json /iventoy-patch.json
+COPY patches/ /patches/
+
+RUN python3 /patches/matrix_boot_hook.py /iventoy/lib/iventoy \
+        --report /iventoy-patch-mb.json && \
+    python3 /patches/matrix_boot_hook.py /iventoy/lib/iventoy \
+        --verify /iventoy-patch-mb.json
+
 # [iventoy-fork] 底包 Debian 13（trixie）。12 那批基础包有一堆 Debian 明确不修、或者还没修的
 # 漏洞，扫描一片红；换 13 之后少了一大截。别改回 bookworm。
 #
@@ -81,9 +103,10 @@ RUN apt-get update \
 # [iventoy-fork] 这里故意不声明 IVENTOY_VERSION：它是构建期的，运行时改不了，
 # 留着只会让人以为 docker run -e 能换版本。
 
-COPY --from=patch /iventoy /iventoy
+COPY --from=mbhook /iventoy /iventoy
 COPY --from=init /usr/share/iventoy/data /usr/share/iventoy/data
-COPY --from=patch /iventoy-patch.json /usr/share/iventoy/patch.json
+COPY --from=mbhook /iventoy-patch.json /usr/share/iventoy/patch.json
+COPY --from=mbhook /iventoy-patch-mb.json /usr/share/iventoy/patch-mb.json
 
 COPY --chmod=755 files/docker-entrypoint.sh /usr/local/bin/docker-entrypoint
 

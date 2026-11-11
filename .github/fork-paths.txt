@@ -16,6 +16,8 @@ deploy/docker-compose.yml
 .github/scripts/sync-dockerhub-page.py
 .github/scripts/check-dockerhub-readme.py
 patches/iventoy_patch.py
+patches/matrix_boot_add.c
+patches/matrix_boot_hook.py
 patches/README.md
 
 # L1 对上游文件的最小改动（均带 [iventoy-fork] 锚点注释）：

@@ -30,6 +30,39 @@
 代价：改写期望值是**运行期写内存**，写的是 tarfs 解密后的堆缓冲区（可写）。若哪天上游把它改成只读映射，
 表现会是启动即段错误 —— 冒烟会当场红。
 
+## 分机独启（matrix boot）：后补的通路
+
+免费版把这条功能裁掉了，但不是「隐藏开关」，而是**编译成桩**：
+
+| 位置 | 免费版行为 |
+|---|---|
+| `pxe_api_add_matrix_boot` | 不解析请求，直接 `snprintf` 回 `{"result":"notsupport"}` |
+| `toy_matrix_boot_add` | `mov eax, -22 ; ret` |
+
+而 `list_json` / `del` / `save` / `recovery` / `proc` / `init` 都是完整实现 —— 也就是说
+记录链表、持久化 TLV、启动流程都在，缺的只是「登记一条」这个入口。所以补法是把入口补回去：
+
+| 文件 | 作用 |
+|---|---|
+| `matrix_boot_add.c` | 等价实现：解析 `bios`/`timeout`/`mac`/`path`，校验 MAC 形态，去重，`g_malloc0(0x101c)` 建记录（`+0x00 bios`、`+0x04 timeout`、`+0x08 mac[18]`、`+0x1a path`），挂到 `g_pstEntryList` |
+| `matrix_boot_hook.py` | 把上面的 C 编成机器码块，找可执行落点（RX 段尾部空隙优先，放不下就追加到文件尾并延长 `p_filesz`），把桩改成 `jmp` 进去；带 `--verify` |
+
+地址全部现场从 ELF 符号表 / PLT 解析，桩的字节形态也要先核对，对不上直接失败。
+构建期在 `$TARGETPLATFORM` 阶段用本机 `gcc` 编译（arm64 在 qemu 下跑），不需要交叉工具链。
+
+功能验证不是「服务起来了」就算：CI 冒烟每次都打一遍真接口 ——
+
+```bash
+curl -s -X POST -H 'Content-Type: application/json' \
+  -d '{"method":"add_matrix_boot","bios":1,"timeout":30,"mac":"11-22-33-44-55-66","path":"smoke.iso"}' \
+  http://127.0.0.1:26000/iventoy/json      # 期望 { "result" : "success" }
+curl -s -X POST -H 'Content-Type: application/json' -d '{"method":"get_matrix_boot"}' \
+  http://127.0.0.1:26000/iventoy/json      # 期望列表里出现刚加的 MAC
+```
+
+写错会怎样：`add` 返回 `exist`（重复）或 `failed`（MAC 形态不对），列表接口照常工作 ——
+因为用的就是上游自己的 list/del 实现，不是另写一套。
+
 ## 为什么上限是 65535 而不是「无限制」
 
 上限就是记录表的容量。`toy_pxe_record_mac_add` 用客户端计数直接做下标写 `g_aucRecordMac[count]`，**上限只要大于数组容量就是越界写**，第 N+1 台客户端会直接写坏相邻内存。

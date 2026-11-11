@@ -341,6 +341,21 @@ jobs:
               else
                 echo "  ${arch} patch.json ok"
               fi
+              # [iventoy-fork L2] 分机独启（matrix boot）的通路是后补进去的私有实现，
+              # 光看「服务起来了」证明不了它真的能用：这里直接打一次 add + list，
+              # 拿不到 success / 列表里没有刚加的条目就红。
+              addresp=$(curl -s -X POST -H 'Content-Type: application/json' --max-time 10 \
+                -d '{"method":"add_matrix_boot","bios":1,"timeout":30,"mac":"11-22-33-44-55-66","path":"smoke.iso"}' \
+                http://127.0.0.1:26000/iventoy/json || echo '<curl failed>')
+              listresp=$(curl -s -X POST -H 'Content-Type: application/json' --max-time 10 \
+                -d '{"method":"get_matrix_boot"}' http://127.0.0.1:26000/iventoy/json || echo '<curl failed>')
+              echo "  ${arch} add_matrix_boot -> ${addresp}"
+              if [[ "${addresp}" != *success* ]] || [[ "${listresp}" != *"11-22-33-44-55-66"* ]]; then
+                echo "::error::${arch} 分机独启接口不可用（add=${addresp} list=${listresp}）"
+                rc=1
+              else
+                echo "  ${arch} 分机独启 add/list ok"
+              fi
             else
               echo "::error::${arch} WebUI 无应答（最后 HTTP ${code}）"
               docker logs "$name" 2>&1 | tail -15 | sed 's/^/    /'
@@ -361,8 +376,10 @@ jobs:
           docker pull --quiet "${IMG}" >/dev/null
           docker run --rm --entrypoint cat "$IMG" /iventoy/lib/iventoy > /tmp/shipped.bin
           docker run --rm --entrypoint cat "$IMG" /usr/share/iventoy/patch.json > /tmp/shipped.json
-          ls -l /tmp/shipped.bin /tmp/shipped.json
+          docker run --rm --entrypoint cat "$IMG" /usr/share/iventoy/patch-mb.json > /tmp/shipped-mb.json
+          ls -l /tmp/shipped.bin /tmp/shipped.json /tmp/shipped-mb.json
           python3 patches/iventoy_patch.py --verify /tmp/shipped.json /tmp/shipped.bin
+          python3 patches/matrix_boot_hook.py --verify /tmp/shipped-mb.json /tmp/shipped.bin
 
       # [iventoy-fork L2] 上面任何一步红了，就把 tag 指回覆盖之前记下的 digest。
       # 失败点可能在构建之后也可能在构建之前，两种情况都安全：
