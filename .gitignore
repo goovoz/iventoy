@@ -1,0 +1,4 @@
+# [iventoy-fork] 本地跑 lint / py_compile 时产生的缓存，不进仓库
+__pycache__/
+*.py[cod]
+.venv/
