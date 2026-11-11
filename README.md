@@ -7,7 +7,8 @@ The image is based on Debian 13 trixie slim. iVentoy runs in foreground mode so 
 ## Versions
 
 Docker Tag:
-* latest / 1.0.49: iVentoy v1.0.49
+* latest / 1.0.49: iVentoy v1.0.49 — released build (patched; 65535 concurrent clients)
+* edge (ghcr.io only): the newest commit on `main` — a development channel rebuilt on every push to `main`. It never feeds `latest` or the version tag, so a broken commit cannot leak into a release.
 
 Images are published to GitHub Container Registry: `ghcr.io/goovoz/iventoy`
 
@@ -149,5 +150,6 @@ This fork follows the official iVentoy releases from [ventoy/PXE](https://github
 - A scheduled GitHub Actions workflow (`.github/workflows/track-iventoy-release.yml`) checks the upstream release feed every day.
 - When a new stable version appears, it bumps the version references in `Dockerfile` and `README.md`, pushes the commit to `main`, creates a `vX.Y.Z` tag, triggers the multi-arch image build, and only reports success once the image is actually published. (`docker-compose.yml` uses `:latest` and `Makefile` reads the version out of the `Dockerfile`, so neither carries a version string of its own.)
 - If the upstream version matches the version in this repository, nothing is pushed — but the workflow still **reconciles the registry**: if `ghcr.io/goovoz/iventoy:<version>` is missing (a previous build failed, the dispatch was rejected, or the tag was pruned), it re-dispatches the build and fails loudly instead of leaving the image silently stuck on an older release.
+- It also **reconciles the image against the source**: every image records the commit that built it (`org.opencontainers.image.revision`). If `main` carries image-affecting commits (`Dockerfile`, `files/`, `patches/`, `.dockerignore`) that the published version tag does not contain, the release is rebuilt from `main`. This is how patch fixes reach `latest` / `<version>` without waiting for a new upstream release.
 
 You can also run it manually: **Actions → "Track iVentoy Upstream Release" → Run workflow** (optionally pinning an explicit version). See [docs/UPSTREAM-SYNC.md](docs/UPSTREAM-SYNC.md) for the full mechanism.

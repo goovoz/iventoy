@@ -47,10 +47,24 @@ iVentoy 官方发布源：[ventoy/PXE releases](https://github.com/ventoy/PXE/re
    - 查询本身失败（401 / 5xx / 网络）记为 `unknown`，本轮不做判定，避免误触发构建风暴
    - 这一条是补 2026-10-21 那类故障的**自愈能力**：当时 bump 与 tag 都成功了、只有派发 403，
      而第二天起 `current == latest` 就永远空跑，镜像会静默停在 1.0.45
+6. **源码漂移对账**（版本未变且镜像已发布时才判）：拿镜像 config blob 里的
+   `org.opencontainers.image.revision`（构建它的提交号）与 `main` 的 HEAD 比较，
+   只看**影响镜像内容**的路径 —— `Dockerfile` / `.dockerignore` / `files/` / `patches/`。
+   - 有差异 = 发布标签落后源码（补丁改了几轮、PR 全合并，但镜像还是旧的），
+     按 `ref=main` 重新派发一次发布构建
+   - 无差异 = 空跑；`docs/`、`README`、workflow 这类提交不会触发重建，
+     避免每天白跑一次多架构构建
+   - 读不到 label / token 失败 → 记 `unknown`，本轮跳过；镜像记录的提交不在仓库历史里
+     → 按「有漂移」处理。宁可多建一次，也不漏掉补丁改动
+   - 这一条是补 2026-11-11 那类故障：代码进了 `main`、镜像没动，属于「合并 ≠ 发布」的盲区
+7. **动作收敛**：把上面 5/6 与版本变更收敛成一个 `action` ∈
+   `release-tag` / `backfill` / `refresh` / `none`，每个动作只对应一个派发 ref
+   （新 tag / 当前 tag / `main`），避免多个 `if` 条件互相打架、同一天重复派发两次构建
 
 ## 镜像发布链路（docker-publish.yml）
 
-- 触发：`vX.Y.Z` 标签推送（其他 tag 不触发）、`workflow_dispatch`（tracker 自动派发或手动）
+- 触发：`vX.Y.Z` 标签推送（其他 tag 不触发）、`workflow_dispatch`（tracker 自动派发或手动）、
+  **`main` 分支推送**（只出 `:edge` 开发通道，见下）
 - 版本来源：tag 事件取 tag；其余触发取 `Dockerfile` 当前默认版本。**解析失败直接中止**，
   不再静默回落到默认值（那会产出 tag 与内容不符的镜像）
 - 发布目标：`ghcr.io/goovoz/iventoy`；配置了 `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN`
@@ -58,8 +72,17 @@ iVentoy 官方发布源：[ventoy/PXE releases](https://github.com/ventoy/PXE/re
 - 标签策略：`latest` + 精确版本号（如 `1.0.47`），不产 major/minor 浮动标签。
   `latest` 只在「tag 版本 == Dockerfile 默认版本」或 dispatch 时刷新，推一个旧 tag
   不会把 `latest` 回退到旧版本
+- **`:edge` 开发通道**：`main` 的每次推送都构建一次多架构镜像并只打 `:edge`（仅 ghcr，
+  不动 Docker Hub）。发布标签（`latest` / `<version>`）完全不参与 —— 一次坏提交也不会
+  污染发布；同时它让「代码是否真的变成了镜像」当场可见，补 2026-11-11 那类盲区。
+  `main` 上的 edge 构建允许被新提交取代（`cancel-in-progress`），tag / dispatch 的发布
+  构建绝不取消（半途取消会在 registry 上留下不完整的多架构索引）
+- tracker 的版本 bump 提交（`chore: auto-update iVentoy ...`）自己会让出 edge 构建：
+  同一次运行里紧跟的 tag 推送才是真正的发布，重复构建没有意义
 - 发布前先跑 `tests/test-container-entrypoint.sh`（`needs: test`），不通过不构建
 - gha 缓存显式指定 `scope=iventoy`：默认按 ref 隔离，否则每个新 tag 都是冷启动
+- 每次构建结尾写 run summary：通道、上游版本、源码提交、客户端上限、所有 tag ——
+  看 run 列表就能判断「这份镜像对应哪份代码」
 
 ## 底包选型（为什么 final 必须是 debian 系，以及为什么是 trixie）
 
@@ -140,6 +163,10 @@ git merge upstream/main
 | tracker 显示「查询 ghcr 失败（unknown）」 | 网络 / ghcr 临时故障 | 本轮跳过判定，次日自动重试；持续出现再看 ghcr 状态页 |
 | 镜像构建失败，日志停在 `wget`/`mv` 步骤 | 上游改了包内顶层目录名或资产命名 | Dockerfile 已改为自动探测顶层目录；若仍失败，看构建日志里 `ls -la /iventoy` 输出确认新结构 |
 | 镜像构建失败 | 上游新版本的运行依赖变化 | 看 docker-publish 日志，修 Dockerfile 后手动派发重建 |
+| 代码已合并进 `main`，但 `latest` / 版本镜像还是旧的 | 「合并 ≠ 发布」：`main` 推送只出 `:edge` | tracker 每天做源码漂移对账并自动按 `main` 重发；要立刻生效就手动 dispatch `docker-publish.yml` |
+| `:edge` 与 `latest` 内容不一致 | 正常：edge 跟着 `main` 走，`latest` 只在发布/漂移对账时刷新 | 想尽快把 `main` 的改动升成发布版：等当天的 tracker，或手动 dispatch |
+| tracker 报「源码漂移 unknown」 | 取 ghcr token / 读 config label 失败 | 本轮跳过，次日重试；持续出现看 ghcr 状态页 |
+| tracker 报「镜像记录的提交不在仓库历史里」 | 镜像来自已删除的分支 / force push | 按有漂移处理，会重发一次；确认 `main` 上代码是期望的即可 |
 
 ## 上游包结构变更记录
 
