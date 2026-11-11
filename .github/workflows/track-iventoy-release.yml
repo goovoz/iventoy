@@ -12,8 +12,8 @@ name: Track iVentoy Upstream Release
 #      （Dockerfile / files/ / patches/ / .dockerignore），就按 main 重新发布一次。
 #      2026-11-11 的故障即此类：补丁改了三轮、PR 全合并进 main，但「合并到 main」不会触发
 #      docker-publish，ghcr 上的 latest / 1.0.49 一直停在打补丁之前那份。
-#      main 的日常提交另有 :edge 开发通道（docker-publish 的 push: branches: [main]），
-#      这里补的是**发布标签**的漂移，两条路互不替代。
+#      main 的提交现在本身就会发布并强制覆盖 latest / 版本号，这条对账是**兜底**：
+#      那次构建失败、被取消、或被 bump 提交跳过时，不再等下一次人工 dispatch。
 #
 # 机制详见 docs/UPSTREAM-SYNC.md。
 

@@ -8,7 +8,8 @@ The image is based on Debian 13 trixie slim. iVentoy runs in foreground mode so 
 
 Docker Tag:
 * latest / 1.0.49: iVentoy v1.0.49 — released build (patched; 65535 concurrent clients)
-* edge (ghcr.io only): the newest commit on `main` — a development channel rebuilt on every push to `main`. It never feeds `latest` or the version tag, so a broken commit cannot leak into a release.
+
+Every commit on `main` rebuilds the image and force-overwrites those tags, so they always track the source. Tags are moved only after the vulnerability scan, the per-architecture boot smoke test and the patch verification have passed — the build product is pushed by digest first, then `latest` / `<version>` are pointed at it.
 
 Images are published to GitHub Container Registry: `ghcr.io/goovoz/iventoy`
 
