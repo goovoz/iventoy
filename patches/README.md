@@ -59,11 +59,16 @@ python3 patches/iventoy_patch.py --check iventoy
 
 `--report` 会输出一份 JSON，记录每个站点的 VA、改前/改后字节和原因，镜像里也留了一份（`/usr/share/iventoy/patch.json`），出问题可以直接对账。
 
-## CI 里的三道闸
+## CI 里的闸门
 
 1. `ci-validate.yml` 的 `patch` 作业：每次 push/PR 都对**当前固定版本**跑 `--check`，签名失配立即红。
 2. `track-iventoy-release.yml`：自动跟新版本时，**先对新版本跑 `--check`**；不通过就中止，不 bump 版本、不打 tag、不派发构建——不会产出坏镜像。
 3. `docker-publish.yml`：发布后按架构起容器验证 `26000` 返回 200，并断言镜像里 `patch.json` 的 `ok` 为 true。
+4. `docker-publish.yml` 的「校验镜像内二进制与补丁报告一致」：把镜像里的 `lib/iventoy` 和构建期写的 `patch.json` 一起取出来，跑
+   `python3 patches/iventoy_patch.py --verify <patch.json> <bin>` 逐站点对字节。冒烟只能证明「容器起得来」，
+   这一步才能证明「镜像里那份二进制真是打过补丁的」——补丁被跳过、被回滚、只改了一半，都会红。
+5. `track-iventoy-release.yml` 的源码漂移对账：`patches/` 的改动如果没进发布镜像，就按 `main` 重发一次发布构建，
+   不用等上游发新版本（2026-11-11 那次的根因就是「合并进 main ≠ 发布了镜像」）。
 
 ## 已知边界
 
