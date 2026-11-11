@@ -42,12 +42,12 @@
 
 其余 `list_json` / `del` / `save` / `recovery` / `proc` / `init` 都是完整实现 ——
 记录链表、TLV 持久化、启动流程都在，缺的只是「登记一条」和「恢复时放回链表」两个入口。
-所以补法是接管这两个桩：
+所以补法是接管这两个桩，再顺手把配置落盘改成串行写（第三个入口，见下一节）：
 
 | 文件 | 作用 |
 |---|---|
-| `matrix_boot_add.c` | 两个入口：`matrix_boot_add_api`（解析 `bios`/`timeout`/`mac`/`path`，校验、去重、建记录、返回 `success`/`exist`/`failed`）和 `matrix_boot_walk_hook`（启动恢复时把记录放回链表） |
-| `matrix_boot_hook.py` | 把上面的 C 编成机器码块，找可执行落点（RX 段尾部的**全零填充**优先，放不下就追加到文件尾并延长 `p_filesz`），再把两个桩改成 `jmp`；带 `--verify` 与 `--check` |
+| `matrix_boot_add.c` | 三个入口：`matrix_boot_add_api`（解析 `bios`/`timeout`/`mac`/`path`，校验、去重、建记录、返回 `success`/`exist`/`failed`）、`matrix_boot_walk_hook`（启动恢复时把记录放回链表）、`buf2file_hook`（配置落盘串行化） |
+| `matrix_boot_hook.py` | 把上面的 C 编成机器码块，找可执行落点（RX 段尾部的**全零填充**优先，放不下就追加到文件尾并延长 `p_filesz`），再把入口改成 `jmp`；带 `--verify` 与 `--check` |
 
 记录布局由 `toy_matrix_boot_list_json` 反推：`+0x00 bios(u8)` / `+0x04 timeout(u32)` /
 `+0x08 mac[18]` / `+0x1a path`，整条 `0x101c` 字节。地址全部现场从符号表 / PLT 解析，
@@ -59,6 +59,32 @@ C 里现在签名就是单参数。
 
 构建期在 `$TARGETPLATFORM` 阶段用本机 `gcc` 编译（arm64 在 qemu 下跑，约多一分钟），
 不需要交叉工具链；两份报告都进镜像：`/usr/share/iventoy/patch.json`、`patch-mb.json`。
+
+### 第三个入口：配置落盘串行化（不是桩，是加固）
+
+`toy_util_buf2file` 的写法是 `open(path, O_WRONLY|O_CREAT|O_TRUNC)` + 一次 `write`，
+**非原子**。它只有两个调用者，都是截断模式：`toy_log_thread_main`（写日志）和
+`toy_pxe_cfg_save`（写 `data/config.dat`），后者会在这些时机被调：
+
+| 调用点 | 时机 |
+|---|---|
+| `http_api_main_proc` | 每次 HTTP API 请求处理完 |
+| `main_stop` | 进程收到 SIGTERM 的关闭流程 |
+| `pxe_api_thread_main` | 服务启动 / 停止 / 镜像刷新 |
+
+`docker restart` 时「API 线程的保存」和「关闭流程的保存」会撞在同一个文件上：
+A 先截断、B 正写到一半，落盘结果就是半截。加载侧 `toy_pxe_cfg_chk_data` 用
+`toy_util_nbd_pkt_filt` 校验头 4 字节，对不上就**整份丢弃**：
+
+```
+config data corrupted, ignore it. [0xaf74fd4e 0x169679e6 2271]
+```
+
+后果不是丢一个条目，而是所有设置回默认、分机独启列表空掉，而且不报错。
+（手工把 `config.dat` 截断一半再启动，就是这个形态，可以复现。）
+
+修法是给写盘加 `flock` 串行：锁目标文件本身（不产生额外锁文件），`close` 即解锁，
+第二个写者等第一个写完。语义按上游原样保留（第 4 个参数为 0 → 截断，非 0 → 追加）。
 
 ### 怎么验
 
@@ -72,8 +98,13 @@ curl -s -X POST -d '{"method":"get_matrix_boot"}' \
   http://127.0.0.1:26000/iventoy/json                 # 期望列表里有刚加的 MAC
 docker restart <容器>                                  # 关键：恢复回调走的就是这段
 curl -s -X POST -d '{"method":"get_matrix_boot"}' \
-  http://127.0.0.1:26000/iventoy/json                 # 条目还在才算过
+  http://127.0.0.1:26000/iventoy/json                 # 条目还在才算过（要轮询，别只查一次）
 ```
+
+**重启后要轮询、不能只查一次**：先应答的是 WebUI 静态页，配置恢复（TLV 回放）在后面
+才完成。QEMU 下的 arm64 实测 3s 以上，慢 runner 更久 —— Build and Push #26 就是查早了
+才报的「条目丢失」，而同一个 commit 的 #25 是绿的。现在冒烟轮询到出现为止（上限 120s），
+并另外断言日志里没有 `config data corrupted`（那条等于整份配置被丢弃）。
 
 写错会得到什么：`exist`（重复）或 `failed`（MAC 形态不对）；恢复回调没接上则重启后列表变空。
 列表/删除用的都是上游自己的实现，不是另写一套。

@@ -5,6 +5,9 @@
  *   2. toy_matrix_boot_walk —— 启动时恢复配置的回调，免费版只打一行
  *      "Recover matrix boot policy" 日志、不往链表里放东西，所以重启后条目全丢。
  *
+ * 另外接管 toy_util_buf2file，把配置落盘串行化（见文件末尾）：它非原子，
+ * 两个线程同时写 config.dat 会写出半截文件，加载侧校验不过就整份丢弃。
+ *
  * 其余（list_json / del / save / recovery / proc / init）都是完整实现。
  * 记录布局由 toy_matrix_boot_list_json 反推：
  *   +0x00 u8  bios(index)
@@ -183,5 +186,80 @@ long matrix_boot_add_api(void *req, char *out, int *outlen)
 
 done:
     *outlen = g_snprintf(out, 0x800000, "%s", result);
+    return 0;
+}
+
+/* ---- 配置落盘串行化 ------------------------------------------------------
+ *
+ * toy_util_buf2file 的写法是 open(path, O_WRONLY|O_CREAT|O_TRUNC) 之后一次
+ * write，非原子。它只有两个调用者：toy_log_thread_main（日志）和
+ * toy_pxe_cfg_save（写 data/config.dat），后者被这些线程/时机调用：
+ *
+ *   http_api_main_proc   —— HTTP API 处理完一次请求之后
+ *   main_stop            —— 进程收到 SIGTERM 的关闭流程
+ *   pxe_api_thread_main  —— 服务启动/停止/镜像刷新
+ *
+ * 重启时「API 线程的保存」和「关闭流程的保存」会撞在同一个文件上：A 先截断，
+ * B 正写到一半，落盘结果就是半截。加载侧 toy_pxe_cfg_chk_data 用
+ * toy_util_nbd_pkt_filt 校验头 4 字节，对不上就整份丢弃：
+ *
+ *     config data corrupted, ignore it. [0xaf74fd4e 0x169679e6 2271]
+ *
+ * 后果不是丢一个条目，而是所有设置回默认、分机独启列表空掉，且不报错。
+ * 这里给写盘加 flock 串行：锁的是目标文件本身（不额外产生锁文件），
+ * 关闭 fd 即解锁。第二个写者必须等第一个写完，写出来的永远是完整文件。
+ *
+ * 语义按上游原样保留：第 4 个参数为 0 → O_WRONLY|O_CREAT|O_TRUNC，
+ * 非 0 → O_WRONLY|O_APPEND。两个现行调用点传的都是 0。
+ */
+extern int open64(const char *path, int flags, int mode);
+extern long write(int fd, const void *buf, unsigned long n);
+extern int close(int fd);
+extern int flock(int fd, int op);
+extern int toy_log(int level, const char *mod, const char *fmt, ...);
+
+#define O_WRITE_  00000001
+#define O_CREAT_  00000100
+#define O_TRUNC_  00001000
+#define O_APPEND_ 00002000
+#define LOCK_EX_  2
+#define LOCK_UN_  8
+
+long buf2file_hook(void *buf, int len, const char *path, int append)
+{
+    int lockfd;
+    int fd;
+    long n;
+
+    if (path == 0) {
+        toy_log(2, "UTIL", "buf2file: null path");
+        return -1;
+    }
+
+    lockfd = open64(path, O_WRITE_ | O_CREAT_, 0644);
+    if (lockfd >= 0)
+        flock(lockfd, LOCK_EX_);
+
+    fd = open64(path, append ? (O_WRITE_ | O_APPEND_)
+                             : (O_WRITE_ | O_CREAT_ | O_TRUNC_), 0644);
+    if (fd < 0) {
+        toy_log(2, "UTIL", "open <%s> for write failed", path);
+        if (lockfd >= 0) {
+            flock(lockfd, LOCK_UN_);
+            close(lockfd);
+        }
+        return -1;
+    }
+
+    n = write(fd, buf, (unsigned long)len);
+    close(fd);
+    if (lockfd >= 0) {
+        flock(lockfd, LOCK_UN_);
+        close(lockfd);
+    }
+    if (n != (long)len) {
+        toy_log(2, "UTIL", "write <%s> short: %ld/%d", path, n, len);
+        return -1;
+    }
     return 0;
 }

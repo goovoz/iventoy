@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""补上免费版被裁掉的两条「分机独启」(matrix boot) 通路。
+"""补上免费版被裁掉的两条「分机独启」(matrix boot) 通路，并把配置落盘改成串行写。
 
 免费版把这两个函数编译成了桩：
 
@@ -9,13 +9,18 @@
 
 而 list / del / save / recovery / proc / init 都是完整实现，缺的只是这两个入口。
 
+第三个入口不是桩，是加固：`toy_util_buf2file` 用 open(O_TRUNC) + 一次 write 落盘，
+非原子。配置保存会在「HTTP API 线程」和「关闭流程」两个线程上同时发生，撞在一起就
+写出半截 config.dat，加载侧校验不过会整份丢弃（config data corrupted, ignore it.）
+—— 所有设置回默认、分机独启列表空掉，且不报错。这里把它换成加 flock 串行的等价实现。
+
 做法：
 
 1. 把 `matrix_boot_add.c` 编成位置无关的机器码块（x86-64 / aarch64，编译器按宿主与
    目标架构自动选：同架构用本机 gcc，否则用 aarch64-linux-gnu-* 交叉工具链）；
 2. 找可执行落点：优先 RX 段尾部到下一个 LOAD 之间的**全零填充**，
    放不下就追加到文件尾并延长 RX 段的 p_filesz/p_memsz；
-3. 把两个桩改成跳进代码块里对应的函数。
+3. 把三个入口改成跳进代码块里对应的函数。
 
 地址一律通过 ELF 符号表 / PLT 现场解析；桩的形态要先核对（大小、以及它是否已经
 被注入过），对不上直接失败 —— 宁可构建红，也不产出半残的镜像。
@@ -54,19 +59,22 @@ TOOLCHAIN = {
 CROSS_PREFIX = {EM_X86_64: "x86_64-linux-gnu-", EM_AARCH64: "aarch64-linux-gnu-"}
 ARCH_NAME = {EM_X86_64: "amd64", EM_AARCH64: "arm64"}
 
-# 要接管的上游函数 -> 代码块里的实现
-STUBS = [
-    ("pxe_api_add_matrix_boot", "matrix_boot_add_api"),
-    ("toy_matrix_boot_walk", "matrix_boot_walk_hook"),
+# 要接管的上游函数 -> (代码块里的实现, 允许的最大长度)
+# None 表示「不是桩，是整体替换」，长度不设上限。
+ENTRIES = [
+    ("pxe_api_add_matrix_boot", "matrix_boot_add_api", 96),
+    ("toy_matrix_boot_walk", "matrix_boot_walk_hook", 96),
+    ("toy_util_buf2file", "buf2file_hook", None),
 ]
-STUB_MAX_LEN = 96          # 超过这个长度说明上游可能已经实现了，别乱覆盖
+STUB_MAX_LEN = 96          # 桩类入口超过这个长度说明上游可能已经实现了，别乱覆盖
 
 # 代码块要引用的外部符号
 FUNC_SYMS = ["toy_json_get_int", "toy_json_get_uint", "toy_json_get_string",
-             "toy_json_get_string_ex"]
+             "toy_json_get_string_ex", "toy_log"]
 FUNC_PLTS = ["g_list_first", "g_list_append", "g_mutex_lock", "g_mutex_unlock",
              "g_malloc0", "g_free", "g_ascii_toupper", "g_regex_match_simple",
-             "g_snprintf", "strcmp", "memcpy", "g_strlcpy"]
+             "g_snprintf", "strcmp", "memcpy", "g_strlcpy",
+             "open64", "write", "close", "flock"]
 DATA_SYMS = ["g_pstEntryList", "g_stMbLock"]
 
 
@@ -213,12 +221,13 @@ def check(binary: str) -> int:
     nxt = min((p for p in plist if p["type"] == 1 and p["vaddr"] > rx["vaddr"]),
               key=lambda p: p["vaddr"], default=None)
     print("%s: 符号齐全" % ARCH_NAME[machine])
-    for sym, fn in STUBS:
+    for sym, fn, maxlen in ENTRIES:
         va, size = elf.sym(sym)
         head = data[elf.off(va):elf.off(va) + min(size, 8)].hex()
-        print("  %-26s va=0x%-7X size=%-3d head=%s  -> %s"
-              % (sym, va, size, head, fn))
-        if size > STUB_MAX_LEN:
+        kind = "桩" if maxlen else "整体替换"
+        print("  %-26s va=0x%-7X size=%-3d head=%s  -> %s（%s）"
+              % (sym, va, size, head, fn, kind))
+        if maxlen and size > maxlen:
             print("  [警告] 该函数 %d 字节，可能上游已经实现，注入会覆盖真实逻辑" % size)
     placement, err = plan_placement(data, rx, nxt, 8192)      # 按 8KB 上限估容量
     gap = (nxt["offset"] - (rx["offset"] + rx["filesz"])) if nxt else 0
@@ -262,12 +271,15 @@ def main() -> int:
     nxt = min((p for p in plist if p["type"] == 1 and p["vaddr"] > rx["vaddr"]),
               key=lambda p: p["vaddr"], default=None)
 
-    # 桩形态先核对：太短 / 已经是跳转（重复注入）都拒绝
+    # 入口形态先核对：太短 / 桩过长 / 已经是跳转（重复注入）都拒绝
     stubs = []
-    for sym, fn in STUBS:
+    for sym, fn, maxlen in ENTRIES:
         va, size = elf.sym(sym)
-        if size < 4 or size > STUB_MAX_LEN:
-            raise SystemExit("%s 大小 %d 不合理（可能上游已实现），拒绝注入" % (sym, size))
+        if size < 4:
+            raise SystemExit("%s 大小 %d 不合理，拒绝注入" % (sym, size))
+        if maxlen and size > maxlen:
+            raise SystemExit("%s 大小 %d > %d（可能上游已实现），拒绝注入"
+                             % (sym, size, maxlen))
         off = elf.off(va)
         old = bytes(data[off:off + size])
         if machine == EM_X86_64 and old[:1] == b"\xe9":
