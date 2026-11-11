@@ -45,6 +45,23 @@ RUN case "${TARGETARCH}" in \
     mkdir -p /usr/share/iventoy/data && \
     cp /iventoy/data/iventoy.dat /iventoy/data/mac.db /usr/share/iventoy/data/
 
+# [iventoy-fork] 补丁阶段：解限（客户端上限 / ARM64+LoongArch 放行 / 自校验与端口反篡改）。
+# 跑在 BUILDPLATFORM 上：补丁是纯字节改写，与架构无关，不需要 qemu、也不用给两个架构各装一份 python。
+# 上游改版后若指令签名对不上，这里会让构建失败，不会产出「能起但功能残缺」的镜像。
+# 每个被改的站点、改前/改后字节都写进 /iventoy-patch.json，随镜像一起发布，便于事后对账。
+# 维护方法见 patches/README.md。
+FROM --platform=$BUILDPLATFORM python:3.12-alpine AS patch
+
+COPY --from=init /iventoy /iventoy
+COPY patches/ /patches/
+
+# [iventoy-fork] 默认 65535：等于一个 /16 网段的主机数，也是 arm64 单条 MOVZ 能编出来的上限。
+# 容量变化会同步放大 .bss 段（脚本按记录数算 p_memsz），不是把常量改大那么简单。
+ARG IVENTOY_MAX_CLIENTS=65535
+RUN python3 /patches/iventoy_patch.py --max-clients "${IVENTOY_MAX_CLIENTS}" \
+        --report /iventoy-patch.json /iventoy/lib/iventoy && \
+    cat /iventoy-patch.json
+
 # [iventoy-fork] 底包 Debian 13（trixie）。12 那批基础包有一堆 Debian 明确不修、或者还没修的
 # 漏洞，扫描一片红；换 13 之后少了一大截。别改回 bookworm。
 #
@@ -64,8 +81,9 @@ RUN apt-get update \
 # [iventoy-fork] 这里故意不声明 IVENTOY_VERSION：它是构建期的，运行时改不了，
 # 留着只会让人以为 docker run -e 能换版本。
 
-COPY --from=init /iventoy /iventoy
+COPY --from=patch /iventoy /iventoy
 COPY --from=init /usr/share/iventoy/data /usr/share/iventoy/data
+COPY --from=patch /iventoy-patch.json /usr/share/iventoy/patch.json
 
 COPY --chmod=755 files/docker-entrypoint.sh /usr/local/bin/docker-entrypoint
 

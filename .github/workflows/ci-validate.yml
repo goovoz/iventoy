@@ -63,6 +63,38 @@ jobs:
       - name: Container entrypoint self-test
         run: sh tests/test-container-entrypoint.sh
 
+  # [iventoy-fork] 补丁签名闸：补丁按符号名 + 指令签名定位，上游一改版就可能失配。
+  # 这里在 push/PR 阶段就拿当前固定版本跑 --check，失配立即红，不用等发版那一刻。
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 校验补丁签名（amd64 + arm64）
+        run: |
+          set -euo pipefail
+          V=$(grep -oP 'IVENTOY_VERSION:-\K[0-9]+\.[0-9]+\.[0-9]+' Dockerfile | head -1)
+          echo "上游版本 v${V}"
+          mkdir -p /tmp/pt
+          rc=0
+          for spec in "amd64 x86_64 free" "arm64 arm64 trial"; do
+            set -- $spec
+            arch=$1; suffix=$2; edition=$3
+            f="iventoy-${V}-linux-${suffix}-${edition}.tar.gz"
+            dir="/tmp/pt/${arch}"
+            mkdir -p "$dir"
+            curl -fsSL --retry 3 --retry-delay 5 -o "/tmp/pt/${f}" \
+              "https://github.com/ventoy/PXE/releases/download/v${V}/${f}"
+            tar -xzf "/tmp/pt/${f}" -C "$dir"
+            echo "--- ${arch} ---"
+            python3 patches/iventoy_patch.py --check "${dir}/iventoy/lib/iventoy" || rc=1
+          done
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::补丁签名与 v${V} 不再匹配，需要重新锚定（见 patches/README.md）"
+          fi
+          exit "$rc"
+
   build:
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/heads/fix/')
     needs: lint

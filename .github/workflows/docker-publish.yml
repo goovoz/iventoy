@@ -180,6 +180,7 @@ jobs:
           sbom: false
           build-args: |
             IVENTOY_VERSION=${{ steps.version.outputs.iventoy_version }}
+            IVENTOY_MAX_CLIENTS=${{ vars.IVENTOY_MAX_CLIENTS || '65535' }}
           # [iventoy-fork L1] gha 缓存默认按 ref 隔离，每个新 tag 都冷启动。
           # 显式 scope 让所有 tag / 分支共用同一份缓存。
           cache-from: type=gha,scope=iventoy
@@ -301,6 +302,15 @@ jobs:
             done
             if [ "$code" = "200" ]; then
               echo "  ${arch} WebUI -> HTTP 200（$(wc -c < /tmp/smoke.html) 字节）"
+              # [iventoy-fork] 顺手确认补丁真的在镜像里：patch.json 缺失或 ok!=true，
+              # 说明构建期补丁被跳过 / 失败被吞，WebUI 也可能是带着随机端口的假活。
+              if ! docker run --rm --platform "linux/${arch}" --entrypoint /bin/sh "$IMG" \
+                   -c 'grep -q "\"ok\": true" /usr/share/iventoy/patch.json'; then
+                echo "::error::${arch} 镜像内 patch.json 缺失或 ok!=true，补丁未生效"
+                rc=1
+              else
+                echo "  ${arch} patch.json ok"
+              fi
             else
               echo "::error::${arch} WebUI 无应答（最后 HTTP ${code}）"
               docker logs "$name" 2>&1 | tail -15 | sed 's/^/    /'
