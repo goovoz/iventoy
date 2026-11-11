@@ -71,3 +71,15 @@ python3 patches/iventoy_patch.py --check iventoy
 - 65535 是**并发出租**上限，不是 DHCP 池大小；池子仍在 WebUI 里配。
 - 补丁改的是「客户端准入」，不改变 PXE/TFTP/HTTP 的实际带宽与并发能力。
 - arm64 上游包是 **trial** 版（官方只发布 arm64 试用版），补丁把它的 1 客户端限制也抬到 65535，但试用版是否还有别的功能限制未逐项验证。
+
+## 调整上限
+
+镜像默认 65535。两种改法都不用动代码：
+
+- **仓库变量（推荐，下次 CI 构建生效）**：Settings → Secrets and variables → Actions → **Variables** → New repository variable，
+  名字 `IVENTOY_MAX_CLIENTS`，值填数字。`docker-publish.yml` 会把它当 `--build-arg` 传下去。
+- **本地构建**：`docker build --build-arg IVENTOY_MAX_CLIENTS=1024 .`
+
+两个约束：数组是 6 字节/条、放在扩出来的 .bss 零页里（脚本按这个数字算 `p_memsz`），
+以及 arm64 的 `MOVZ` 只有 16 位立即数（超过 65535 脚本会编成 `movz`+`movk`，能用但没必要）。
+设成 0 或负数，脚本直接失败。
