@@ -48,7 +48,7 @@ from iventoy_patch import ELF  # noqa: E402
 
 EM_X86_64, EM_AARCH64 = 62, 183
 
-CFLAGS = ("-O2 -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fno-pie "
+CFLAGS = ("-Os -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fno-pie "
           "-fno-asynchronous-unwind-tables -fno-unwind-tables -Wall -Wextra").split()
 
 TOOLCHAIN = {
@@ -63,19 +63,29 @@ ARCH_NAME = {EM_X86_64: "amd64", EM_AARCH64: "arm64"}
 # None 表示「不是桩，是整体替换」，长度不设上限。
 ENTRIES = [
     ("pxe_api_add_matrix_boot", "matrix_boot_add_api", 96),
+    ("pxe_api_clr_matrix_boot", "matrix_boot_clr_api", 96),
     ("toy_matrix_boot_walk", "matrix_boot_walk_hook", 96),
     ("toy_util_buf2file", "buf2file_hook", None),
 ]
 STUB_MAX_LEN = 96          # 桩类入口超过这个长度说明上游可能已经实现了，别乱覆盖
 
+# 调用点重定向：把 (上游函数) 的所有 call 改成调到 (代码块里的实现)。
+# 用于「不能替换函数本身、但需要在其调用前后插一段逻辑」的场合 —— 这里是用它
+# 在 tarfs 查找静态文件时改内存里的 WebUI 页面（免费版把分机独启按钮的前台闸门
+# 写死在 index.html 的 g_current_edition = 0 上）。
+CALL_REDIRECTS = [
+    ("toy_tarfs_find_file", "tarfs_find_hook"),
+]
+
 # 代码块要引用的外部符号
 FUNC_SYMS = ["toy_json_get_int", "toy_json_get_uint", "toy_json_get_string",
-             "toy_json_get_string_ex", "toy_log"]
+             "toy_json_get_string_ex", "toy_log", "toy_tarfs_find_file",
+             "toy_matrix_boot_clear_all"]
 FUNC_PLTS = ["g_list_first", "g_list_append", "g_mutex_lock", "g_mutex_unlock",
              "g_malloc0", "g_free", "g_ascii_toupper", "g_regex_match_simple",
              "g_snprintf", "strcmp", "memcpy", "g_strlcpy",
-             "open64", "write", "close", "flock"]
-DATA_SYMS = ["g_pstEntryList", "g_stMbLock"]
+             "open64", "write", "close", "flock", "memcmp"]
+DATA_SYMS = ["g_pstEntryList", "g_stMbLock", "g_pucTarfsBuf", "g_iTarfsLen"]
 
 
 def toolchain(machine: int) -> tuple[str, str, str, list[str]]:
@@ -178,6 +188,68 @@ def make_jump(machine: int, from_va: int, to_va: int, length: int) -> bytes:
     return jmp + b"\x90" * (length - len(jmp))
 
 
+def injected(machine: int, va: int, size: int, old: bytes) -> bool:
+    """判断这个入口是不是已经被注入过。
+
+    arm64 上不能靠「第一条指令是 b」判断：编译器会把几个内容相同的桩折叠成
+    `b <另一个桩>`（实测 pxe_api_clr_matrix_boot 就是 `b pxe_api_add_matrix_boot`），
+    这是上游的正常形态。x86 只在 jmp rel32 跳到本函数体之外时才认定是注入痕迹，
+    arm64 直接放行（重复注入的后果只是多一份代码块，钩子本身幂等）。
+    """
+    if machine == EM_X86_64:
+        if old[:1] == b"\xe9":
+            rel = struct.unpack_from("<i", old, 1)[0]
+            target = va + 5 + rel
+            return not (va <= target < va + size)
+    return False
+
+
+def redirect_calls(data: bytearray, machine: int, rx, hi: int,
+                   target_va: int, hook_va: int) -> list[dict]:
+    """把 RX 段内所有「调用 target_va」的指令改成调用 hook_va。
+
+    x86-64 认 `e8 rel32`，aarch64 认 `bl imm26`。目标地址一律按 VA 现算现比，
+    所以上游版本挪了位置也不用改脚本；距离越界直接失败。
+    """
+    lo = rx["offset"]
+    base = rx["vaddr"] - rx["offset"]
+    out: list[dict] = []
+    if machine == EM_X86_64:
+        i = lo
+        while i < hi - 5:
+            if data[i] == 0xE8:
+                rel = struct.unpack_from("<i", data, i + 1)[0]
+                va = i + base
+                if va + 5 + rel == target_va:
+                    new_rel = hook_va - (va + 5)
+                    if not -(1 << 31) <= new_rel < (1 << 31):
+                        raise SystemExit("调用点重定向超出 rel32（0x%X）" % va)
+                    old = bytes(data[i:i + 5])
+                    struct.pack_into("<i", data, i + 1, new_rel)
+                    out.append({"va": "0x%X" % va, "off": i, "old": old.hex(),
+                                "new": bytes(data[i:i + 5]).hex()})
+            i += 1
+    else:
+        i = lo
+        while i < hi - 4:
+            w = struct.unpack_from("<I", data, i)[0]
+            if (w >> 26) == 0x25:                       # bl
+                imm = w & 0x03FFFFFF
+                if imm & 0x02000000:
+                    imm -= 0x04000000
+                va = i + base
+                if va + imm * 4 == target_va:
+                    delta = (hook_va - va) >> 2
+                    if not -(1 << 25) <= delta < (1 << 25):
+                        raise SystemExit("调用点重定向超出 bl 范围（0x%X）" % va)
+                    old = bytes(data[i:i + 4])
+                    struct.pack_into("<I", data, i, 0x94000000 | (delta & 0x03FFFFFF))
+                    out.append({"va": "0x%X" % va, "off": i, "old": old.hex(),
+                                "new": bytes(data[i:i + 4]).hex()})
+            i += 4
+    return out
+
+
 def verify(binary: str, report_path: str) -> int:
     rep = json.loads(Path(report_path).read_text())
     data = Path(binary).read_bytes()
@@ -193,6 +265,13 @@ def verify(binary: str, report_path: str) -> int:
         if got.hex() != stub["new"]:
             print("FAIL: %s 处的字节与报告不符" % stub["symbol"], file=sys.stderr)
             return 1
+    for site in rep.get("callsites", []):
+        off = site["off"]
+        got = data[off:off + len(site["new"]) // 2]
+        if got.hex() != site["new"]:
+            print("FAIL: %s 的调用点 0x%s 与报告不符" % (site["target"], site["va"]),
+                  file=sys.stderr)
+            return 1
     for p in phdrs(data):
         if p["off"] == rep["phdr_off"]:
             if p["filesz"] != rep["rx_filesz"] or p["memsz"] != rep["rx_memsz"]:
@@ -201,8 +280,9 @@ def verify(binary: str, report_path: str) -> int:
             break
     else:
         raise SystemExit("FAIL: 找不到记录的 program header")
-    print("OK: 分机独启钩子在位（cave 0x%X，%d 字节，%d 个入口）"
-          % (rep["cave_va"], rep["blob_len"], len(rep["stubs"])))
+    print("OK: 分机独启钩子在位（cave 0x%X，%d 字节，%d 个入口，%d 个调用点）"
+          % (rep["cave_va"], rep["blob_len"], len(rep["stubs"]),
+             len(rep.get("callsites", []))))
     return 0
 
 
@@ -229,6 +309,13 @@ def check(binary: str) -> int:
               % (sym, va, size, head, fn, kind))
         if maxlen and size > maxlen:
             print("  [警告] 该函数 %d 字节，可能上游已经实现，注入会覆盖真实逻辑" % size)
+    probe = bytearray(data)
+    for target_sym, hook_fn in CALL_REDIRECTS:
+        target_va, _sz = elf.sym(target_sym)
+        n = len(redirect_calls(probe, machine, rx, rx["offset"] + rx["filesz"],
+                              target_va, target_va))
+        mark = "" if n else "  [警告] 找不到调用点，注入会直接失败"
+        print("  调用点 %-24s %d 处 -> %s%s" % (target_sym, n, hook_fn, mark))
     placement, err = plan_placement(data, rx, nxt, 8192)      # 按 8KB 上限估容量
     gap = (nxt["offset"] - (rx["offset"] + rx["filesz"])) if nxt else 0
     if placement is not None:
@@ -282,10 +369,8 @@ def main() -> int:
                              % (sym, size, maxlen))
         off = elf.off(va)
         old = bytes(data[off:off + size])
-        if machine == EM_X86_64 and old[:1] == b"\xe9":
-            raise SystemExit("%s 已经是 jmp，看起来被注入过，拒绝重复注入" % sym)
-        if machine == EM_AARCH64 and struct.unpack_from("<I", old, 0)[0] >> 26 == 0x5:
-            raise SystemExit("%s 已经是 b，看起来被注入过，拒绝重复注入" % sym)
+        if injected(machine, va, size, old):
+            raise SystemExit("%s 已经是被改过的跳转，看起来注入过，拒绝重复注入" % sym)
         stubs.append({"symbol": sym, "target": fn, "va": va, "off": off,
                       "len": size, "old": old})
 
@@ -306,6 +391,7 @@ def main() -> int:
             raise SystemExit(err)
 
     kind, cave_off, cave_va, new_filesz = placement
+    rx_hi_orig = rx["offset"] + rx["filesz"]          # 重定向只扫原始代码，别扫到代码块
     struct.pack_into("<Q", data, rx["off"] + 32, new_filesz)     # p_filesz
     struct.pack_into("<Q", data, rx["off"] + 40, new_filesz)     # p_memsz
     if cave_off > len(data):
@@ -322,6 +408,21 @@ def main() -> int:
                         "len": stub["len"], "old": stub["old"].hex(),
                         "new": new.hex(), "target_va": "0x%X" % target_va})
 
+    callsites = []
+    for target_sym, hook_fn in CALL_REDIRECTS:
+        target_va, _sz = elf.sym(target_sym)
+        hook_va, _sz = blob_elf.sym(hook_fn)
+        sites = redirect_calls(data, machine, rx, rx_hi_orig, target_va, hook_va)
+        if not sites:
+            raise SystemExit("%s 没有找到任何调用点，拒绝产出（上游可能改名/内联了）"
+                             % target_sym)
+        for s in sites:
+            s["target"] = target_sym
+            s["hook"] = hook_fn
+        callsites.extend(sites)
+        print("  调用点重定向：%s x%d -> %s @0x%X"
+              % (target_sym, len(sites), hook_fn, hook_va))
+
     out = bytes(data)
     path.write_bytes(out)
     report = {
@@ -335,6 +436,7 @@ def main() -> int:
         "blob_len": len(blob),
         "blob_sha256": hashlib.sha256(blob).hexdigest(),
         "stubs": patched,
+        "callsites": callsites,
         "phdr_off": rx["off"],
         "rx_filesz": new_filesz,
         "rx_memsz": new_filesz,

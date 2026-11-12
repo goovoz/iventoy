@@ -8,6 +8,9 @@
  * 另外接管 toy_util_buf2file，把配置落盘串行化（见文件末尾）：它非原子，
  * 两个线程同时写 config.dat 会写出半截文件，加载侧校验不过就整份丢弃。
  *
+ * 最后一个入口不是函数替换而是调用点重定向：toy_tarfs_find_file 的调用方全改到
+ * tarfs_find_hook，用来在内存里拆掉 WebUI 的「专业版本」前台闸门（见文件末尾）。
+ *
  * 其余（list_json / del / save / recovery / proc / init）都是完整实现。
  * 记录布局由 toy_matrix_boot_list_json 反推：
  *   +0x00 u8  bios(index)
@@ -261,5 +264,110 @@ long buf2file_hook(void *buf, int len, const char *path, int append)
         toy_log(2, "UTIL", "write <%s> short: %ld/%d", path, n, len);
         return -1;
     }
+    return 0;
+}
+
+/* ---- 免费版 UI 闸门：分机独启的三个按钮 ---------------------------------
+ *
+ * WebUI 的 matrix-boot.html 里三处：
+ *     if (g_current_edition === 0) { Message.error(STR_EDITION_NOT_SUPPORT); return; }
+ * 也就是「新增 / 清除 / 导入」在免费版里根本没走到接口 —— 接口补好了也点不动。
+ * 而 g_current_edition 全站只有一处赋值，在 index.html：
+ *     g_current_edition = 0;
+ *
+ * 页面资源打包在 data/iventoy.dat 里：tar 包，每 4 字节做过字节翻转，外面套
+ * 0x80 字节 RSA 签名，toy_tarfs_init 用内嵌公钥验签，签名不过就整份不加载。
+ * 所以改盘上的 .dat 会直接毁掉 WebUI；改成在 tarfs 解压后的内存缓冲里把那一个
+ * 字节换掉，磁盘不动、签名也不动。
+ *
+ * 触发点：脚本把 toy_tarfs_find_file 的所有调用点重定向到这里（按 VA 重算
+ * x86 的 rel32 / arm64 的 bl imm26），只在请求 .html 时扫一遍缓冲，改完照原样
+ * 调原函数，行为其余部分完全不变。
+ */
+extern void *g_pucTarfsBuf;
+extern int g_iTarfsLen;
+extern void *toy_tarfs_find_file(const char *path, void *size_out);
+extern int memcmp(const void *a, const void *b, usize n);
+
+#define EDITION_PAT "g_current_edition = 0"
+#define WORD_G      0x6767676767676767UL      /* 'g' x8 */
+#define WORD_ONE    0x0101010101010101UL
+#define WORD_HIGH   0x8080808080808080UL
+
+static int str_has(const char *s, const char *needle)
+{
+    usize i;
+    usize j;
+
+    for (i = 0; s[i]; i++) {
+        for (j = 0; needle[j] && s[i + j] == needle[j]; j++)
+            ;
+        if (needle[j] == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/* 缓冲有几十 MB，逐字节走太慢；先按 8 字节字跳过不含 'g' 的块（memchr 在这个
+ * 二进制里没被导入，只能自己写）。只在请求 .html 时调用，一次几毫秒。 */
+static void patch_ui_edition(const char *path)
+{
+    unsigned char *buf = (unsigned char *)g_pucTarfsBuf;
+    unsigned char *p;
+    unsigned char *end;
+    int len = g_iTarfsLen;
+    int hits = 0;
+    usize patlen = sizeof(EDITION_PAT) - 1;
+
+    if (buf == 0 || len <= (int)patlen + 8 || path == 0)
+        return;
+    if (!str_has(path, ".html"))
+        return;
+
+    end = buf + len;
+    p = buf;
+    while (p + patlen <= end) {
+        while (p + 8 <= end) {
+            unsigned long w = 0;
+            unsigned long x;
+
+            memcpy(&w, p, 8);
+            x = w ^ WORD_G;
+            if (((x - WORD_ONE) & ~x & WORD_HIGH) != 0)
+                break;                          /* 这 8 字节里有 'g'，细看 */
+            p += 8;
+        }
+        if (p + patlen > end)
+            break;
+        if (memcmp(p, EDITION_PAT, patlen) == 0) {
+            p[patlen - 1] = '1';                /* 末尾的 '0' -> '1' */
+            hits++;
+        }
+        p++;
+    }
+    if (hits > 0)
+        toy_log(3, "HOOK", "matrix boot: unlocked %d web UI edition gate(s)", hits);
+}
+
+void *tarfs_find_hook(const char *path, void *size_out)
+{
+    patch_ui_edition(path);
+    return toy_tarfs_find_file(path, size_out);
+}
+
+/* ---- 「清除」按钮 ---------------------------------------------------------
+ * pxe_api_clr_matrix_boot 也是桩（跟 add 一样只回 notsupport），但数据层
+ * toy_matrix_boot_clear_all 是完整实现：加锁、g_list_free_full、置空链表。
+ * 这里补一个完整处理器，语义照 list/del 那一套：写 out 并返回 0；
+ * 配置落盘由分派器在 flags&1 的分支里统一做（见 http_api_main_proc 0x44D7E9）。
+ */
+extern int toy_matrix_boot_clear_all(void);
+
+long matrix_boot_clr_api(void *req, char *out, int *outlen)
+{
+    (void)req;
+    toy_matrix_boot_clear_all();
+    toy_log(3, "HOOK", "matrix boot: cleared all entries");
+    *outlen = g_snprintf(out, 0x800000, "%s", MSG_OK);
     return 0;
 }
