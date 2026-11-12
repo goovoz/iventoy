@@ -365,20 +365,6 @@ jobs:
                 rc=1
               else
                 echo "  ${arch} 分机独启 add/list ok"
-              # 「清除」走的是另一个接口（clr_matrix_boot），arm64 上它的桩被编译器折叠成
-              # `b pxe_api_add_matrix_boot`，接管 add 之后会一脚踩进 add 的处理器里回 failed。
-              # 所以这条必须单独打一遍：清除后列表要真的空。
-              clrresp=$(curl -s -X POST -H 'Content-Type: application/json' --max-time 10 \
-                -d '{"method":"clr_matrix_boot"}' http://127.0.0.1:26000/iventoy/json || echo '<curl failed>')
-              clrlist=$(curl -s -X POST -H 'Content-Type: application/json' --max-time 10 \
-                -d '{"method":"get_matrix_boot"}' http://127.0.0.1:26000/iventoy/json || echo '<curl failed>')
-              echo "  ${arch} clr_matrix_boot -> ${clrresp}"
-              if [[ "${clrresp}" != *success* ]] || [ "${clrlist}" != "[]" ]; then
-                echo "::error::${arch} 分机独启清除失败（clr=${clrresp} list=${clrlist}）"
-                rc=1
-              else
-                echo "  ${arch} 分机独启清除 ok（列表已空）"
-              fi
               fi
               # [iventoy-fork L2] 条目能不能活过重启：启动恢复回调在免费版里同样被裁成桩
               # （只打日志不入链表），我们另外接管了它。这里真重启一次再确认列表。
@@ -406,6 +392,20 @@ jobs:
                 docker logs "$name" 2>&1 | grep -iE 'corrupted|recover' | tail -10 | sed 's/^/    /' || true
                 docker logs "$name" 2>&1 | tail -25 | sed 's/^/    /'
                 rc=1
+              fi
+              # 「清除」走的是另一个接口（clr_matrix_boot），arm64 上它的桩被编译器折叠成
+              # `b pxe_api_add_matrix_boot`，接管 add 之后会一脚踩进 add 的处理器里回 failed。
+              # 所以这条必须单独打一遍：清除后列表要真的空。
+              clrresp=$(curl -s -X POST -H 'Content-Type: application/json' --max-time 10 \
+                -d '{"method":"clr_matrix_boot"}' http://127.0.0.1:26000/iventoy/json || echo '<curl failed>')
+              clrlist=$(curl -s -X POST -H 'Content-Type: application/json' --max-time 10 \
+                -d '{"method":"get_matrix_boot"}' http://127.0.0.1:26000/iventoy/json || echo '<curl failed>')
+              echo "  ${arch} clr_matrix_boot -> ${clrresp}"
+              if [[ "${clrresp}" != *success* ]] || [ "${clrlist}" != "[]" ]; then
+                echo "::error::${arch} 分机独启清除失败（clr=${clrresp} list=${clrlist}）"
+                rc=1
+              else
+                echo "  ${arch} 分机独启清除 ok（列表已空）"
               fi
               # config.dat 被写坏会整份丢弃（"config data corrupted, ignore it."），
               # 那时掉的是所有设置，不只是分机独启条目 —— 单独断言一条。
