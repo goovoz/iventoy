@@ -118,6 +118,10 @@ vtoy_register.html  g_current_edition = data.edition; ->  g_current_edition = 1
 页面长度、tar 结构、RSA 签名全不变。日志里能对上：
 `[HOOK] matrix boot: unlocked 2 web UI edition gate(s)`。
 
+**只有这两个页面会触发扫描**（根路径也走这条，服务端最终落到 `index.html`；`find_file`
+内部那次递归调用同样被重定向到钩子）。面板页和静态资源零开销 —— RK3566 上实测扫描一次
+是 76ms，收紧前每个 `.html` 请求都要付这个钱，点一下面板就卡一下。
+
 ### 怎么验
 
 CI 的冒烟不是「服务起来了」就算，每次都打真接口并**重启一次容器**：

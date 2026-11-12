@@ -375,7 +375,9 @@ def main() -> int:
                       "len": size, "old": old})
 
     src = Path(args.c_source)
-    rx_end_va = rx["vaddr"] + (rx["offset"] + rx["filesz"] - rx["offset"])
+    # RX 段结束的 VA：不能写成 vaddr + filesz —— 那等于假设段在文件里的偏移是 0。
+    rx_end_file = rx["offset"] + rx["filesz"]
+    rx_end_va = rx["vaddr"] + (rx_end_file - rx["offset"])
     blob, blob_elf = compile_blob(machine, rx_end_va, syms, src)
     placement, err = plan_placement(bytes(data), rx, nxt, len(blob))
     if placement is None:
