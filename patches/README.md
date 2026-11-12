@@ -37,8 +37,14 @@
 | 位置 | 免费版行为 |
 |---|---|
 | `pxe_api_add_matrix_boot` | 不解析请求，直接 `snprintf` 回 `{"result":"notsupport"}` |
+| `pxe_api_clr_matrix_boot` | 同上。arm64 上编译器把它**折叠**成 `b pxe_api_add_matrix_boot`，所以接管 add 桩之后，`clr_matrix_boot` 会一脚踩进 add 的处理器里，因为缺参数回 `failed` —— 这个形态很能骗人 |
 | `toy_matrix_boot_walk` | 启动恢复回调：只打一行 `Recover matrix boot policy` 日志，**不往链表里放东西** → 重启后条目全丢 |
 | `toy_matrix_boot_add` | `mov eax, -22 ; ret`（没人调用它，接口层根本没走到这里） |
+
+另外前端还有一道闸门（跟接口无关）：`matrix-boot.html` 里「新增 / 清除 / 导入」三个按钮
+开头都有 `if (g_current_edition === 0) { 提示「此功能只在专业版本中支持」; return; }`，
+而 `g_current_edition` 全站只有一处赋值 —— `index.html` 里的 `g_current_edition = 0;`。
+接口补好了、页面照样点不动，就是卡在这里。
 
 其余 `list_json` / `del` / `save` / `recovery` / `proc` / `init` 都是完整实现 ——
 记录链表、TLV 持久化、启动流程都在，缺的只是「登记一条」和「恢复时放回链表」两个入口。
@@ -46,8 +52,8 @@
 
 | 文件 | 作用 |
 |---|---|
-| `matrix_boot_add.c` | 三个入口：`matrix_boot_add_api`（解析 `bios`/`timeout`/`mac`/`path`，校验、去重、建记录、返回 `success`/`exist`/`failed`）、`matrix_boot_walk_hook`（启动恢复时把记录放回链表）、`buf2file_hook`（配置落盘串行化） |
-| `matrix_boot_hook.py` | 把上面的 C 编成机器码块，找可执行落点（RX 段尾部的**全零填充**优先，放不下就追加到文件尾并延长 `p_filesz`），再把入口改成 `jmp`；带 `--verify` 与 `--check` |
+| `matrix_boot_add.c` | 四个入口：`matrix_boot_add_api` / `matrix_boot_clr_api`（新增、清除）、`matrix_boot_walk_hook`（启动恢复时把记录放回链表）、`buf2file_hook`（配置落盘串行化），外加 `tarfs_find_hook`（拆 WebUI 前台闸门） |
+| `matrix_boot_hook.py` | 把上面的 C 编成机器码块，找可执行落点（RX 段尾部的**全零填充**优先，放不下就追加到文件尾并延长 `p_filesz`），把桩改成 `jmp` / `b`，并把 `toy_tarfs_find_file` 的调用点重定向；带 `--verify` 与 `--check` |
 
 记录布局由 `toy_matrix_boot_list_json` 反推：`+0x00 bios(u8)` / `+0x04 timeout(u32)` /
 `+0x08 mac[18]` / `+0x1a path`，整条 `0x101c` 字节。地址全部现场从符号表 / PLT 解析，
@@ -86,6 +92,26 @@ config data corrupted, ignore it. [0xaf74fd4e 0x169679e6 2271]
 修法是给写盘加 `flock` 串行：锁目标文件本身（不产生额外锁文件），`close` 即解锁，
 第二个写者等第一个写完。语义按上游原样保留（第 4 个参数为 0 → 截断，非 0 → 追加）。
 
+### 第四个入口：拆 WebUI 的前台闸门（调用点重定向）
+
+页面资源打包在 `data/iventoy.dat`：tar 包，每个 4 字节做过字节翻转，外层再套
+0x80 字节 RSA 签名，`toy_tarfs_init` 用内嵌公钥验签、对不上就整份不加载。
+所以**不能改盘上的 .dat**（改一个字节 WebUI 就没了），只能在 tarfs 解压后的内存缓冲
+`g_pucTarfsBuf`（长度 `g_iTarfsLen`）里动手。
+
+`toy_tarfs_find_file` 自己不能整体替换（它还要被 tftp、ISO 解析、启动器共用），
+所以脚本改成**重定向它的调用点**：x86 认 `e8 rel32`、arm64 认 `bl imm26`，
+目标地址按 VA 现算现比，换了版本也不用改脚本（当前两架构各 14 处）。
+钩子在请求 `.html` 时按 8 字节字扫一遍缓冲（`memchr` 在这个二进制里没被导入，
+所以自己做了个 `(x-0x01..) & ~x & 0x80..` 的跳过），把
+
+```
+g_current_edition = 0;      →      g_current_edition = 1;
+```
+
+改掉，然后照原样调用原函数。页面长度不变、tar 结构不变、签名也不动。
+日志里能对上：`[HOOK] matrix boot: unlocked 1 web UI edition gate(s)`。
+
 ### 怎么验
 
 CI 的冒烟不是「服务起来了」就算，每次都打真接口并**重启一次容器**：
@@ -106,8 +132,17 @@ curl -s -X POST -d '{"method":"get_matrix_boot"}' \
 才报的「条目丢失」，而同一个 commit 的 #25 是绿的。现在冒烟轮询到出现为止（上限 120s），
 并另外断言日志里没有 `config data corrupted`（那条等于整份配置被丢弃）。
 
+三个按钮对应的接口，冒烟里也都打一遍：
+
+```bash
+curl -s http://127.0.0.1:26000/ | grep -q 'g_current_edition = 1;'   # 前台闸门已拆
+curl -s -X POST -d '{"method":"add_matrix_boot",...}'  ...           # 新增 / 导入
+curl -s -X POST -d '{"method":"clr_matrix_boot"}'      ...           # 清除 → 列表变 []
+curl -s -X POST -d '{"method":"del_matrix_boot",...}'  ...           # 删除
+```
+
 写错会得到什么：`exist`（重复）或 `failed`（MAC 形态不对）；恢复回调没接上则重启后列表变空。
-列表/删除用的都是上游自己的实现，不是另写一套。
+列表 / 删除 / 清除用的都是上游自己的数据层实现，不是另写一套。
 
 ## 为什么上限是 65535 而不是「无限制」
 
