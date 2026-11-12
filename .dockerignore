@@ -8,3 +8,7 @@ tests
 Makefile
 docker-compose.yml
 README.md
+# make localtest 会在仓库里建这两个目录；ISO 动辄几个 G，别塞进构建上下文
+isos
+data-out
+*.iso

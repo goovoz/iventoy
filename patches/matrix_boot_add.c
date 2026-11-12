@@ -316,8 +316,27 @@ static int str_has(const char *s, const char *needle)
     return 0;
 }
 
+/* 只有这两个页面需要改写：index.html（全局赋 0）和 vtoy_register.html（覆盖回服务端值）。
+ * 不加这个判断的话每个 .html 请求都要扫一遍几十 MB 的缓冲 —— 实测 RK3566 上一次 76ms，
+ * 而静态资源只要 1.5ms，面板点一下就卡半秒。
+ *
+ * 根路径（"/"、空串）没有扩展名，服务端最终会落到 index.html；find_file 内部那次
+ * 递归调用也被重定向到了这里，所以真正命中时路径就是 "index.html"。 */
+static int is_ui_page(const char *path)
+{
+    usize i;
+
+    if (str_has(path, "index.html") || str_has(path, "vtoy_register"))
+        return 1;
+    for (i = 0; path[i]; i++) {
+        if (path[i] == '.')
+            return 0;
+    }
+    return 1;                                   /* 无扩展名 = 目录请求 */
+}
+
 /* 缓冲有几十 MB，逐字节走太慢；先按 8 字节字跳过不含 'g' 的块（memchr 在这个
- * 二进制里没被导入，只能自己写）。只在请求 .html 时调用，一次几毫秒。
+ * 二进制里没被导入，只能自己写）。
  *
  * 两处替换都保持长度不变，页面的 Content-Length、tar 结构、RSA 签名都不动：
  *   g_current_edition = 0;              -> g_current_edition = 1;      (index.html)
@@ -334,7 +353,7 @@ static void patch_ui_edition(const char *path)
 
     if (buf == 0 || len <= (int)patlen + 8 || path == 0)
         return;
-    if (!str_has(path, ".html"))
+    if (!is_ui_page(path))
         return;
 
     end = buf + len;
