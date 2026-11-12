@@ -290,6 +290,14 @@ extern void *toy_tarfs_find_file(const char *path, void *size_out);
 extern int memcmp(const void *a, const void *b, usize n);
 
 #define EDITION_PAT "g_current_edition = 0"
+/* 版本信息页（vtoy_register.html）会把全局值覆盖回服务端返回的 edition：
+ *     g_current_edition = data.edition;
+ * 而免费版服务端这个字段是硬编码的 xor r8d,r8d（不是算出来的），所以一进这个页面
+ * 页脚就从「专业版本」变回「免费版本 + 注册成为专业版本」。等长替换成常量 1：
+ * "data.edition"（12 字节）-> "1" + 11 个空格，JS 语法不变。 */
+#define EDITION_ASSIGN_PAT "g_current_edition = data.edition"
+#define EDITION_ASSIGN_LEN 32
+#define EDITION_ASSIGN_REPL "1           "
 #define WORD_G      0x6767676767676767UL      /* 'g' x8 */
 #define WORD_ONE    0x0101010101010101UL
 #define WORD_HIGH   0x8080808080808080UL
@@ -309,7 +317,12 @@ static int str_has(const char *s, const char *needle)
 }
 
 /* 缓冲有几十 MB，逐字节走太慢；先按 8 字节字跳过不含 'g' 的块（memchr 在这个
- * 二进制里没被导入，只能自己写）。只在请求 .html 时调用，一次几毫秒。 */
+ * 二进制里没被导入，只能自己写）。只在请求 .html 时调用，一次几毫秒。
+ *
+ * 两处替换都保持长度不变，页面的 Content-Length、tar 结构、RSA 签名都不动：
+ *   g_current_edition = 0;              -> g_current_edition = 1;      (index.html)
+ *   g_current_edition = data.edition;   -> g_current_edition = 1      ;(vtoy_register.html)
+ */
 static void patch_ui_edition(const char *path)
 {
     unsigned char *buf = (unsigned char *)g_pucTarfsBuf;
@@ -341,6 +354,10 @@ static void patch_ui_edition(const char *path)
             break;
         if (memcmp(p, EDITION_PAT, patlen) == 0) {
             p[patlen - 1] = '1';                /* 末尾的 '0' -> '1' */
+            hits++;
+        } else if ((usize)(end - p) >= EDITION_ASSIGN_LEN &&
+                   memcmp(p, EDITION_ASSIGN_PAT, EDITION_ASSIGN_LEN) == 0) {
+            memcpy(p + EDITION_ASSIGN_LEN - 12, EDITION_ASSIGN_REPL, 12);
             hits++;
         }
         p++;
