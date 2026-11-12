@@ -349,6 +349,15 @@ jobs:
                 rc=1
               else
                 echo "  ${arch} WebUI 前台闸门已拆"
+                # 「版本信息」页会把全局值覆盖回服务端返回的 edition（免费版硬编码 0），
+                # 不盖掉它页脚又会变回「免费版本」。这里确认那一处也被替换成了常量 1。
+                if ! curl -s --max-time 10 http://127.0.0.1:26000/vtoy_register.html | grep -q 'g_current_edition = 1 '; then
+                  echo "::error::${arch} 版本信息页仍把 edition 覆盖回服务端值（页脚会显示免费版本）"
+                  curl -s --max-time 10 http://127.0.0.1:26000/vtoy_register.html | grep -o 'g_current_edition = [^;]*;' | head -2 | sed 's/^/    /'
+                  rc=1
+                else
+                  echo "  ${arch} 版本信息页 edition 已是常量"
+                fi
               fi
               fi
               # [iventoy-fork L2] 分机独启（matrix boot）的通路是后补进去的私有实现，

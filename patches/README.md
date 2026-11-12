@@ -103,14 +103,20 @@ config data corrupted, ignore it. [0xaf74fd4e 0x169679e6 2271]
 所以脚本改成**重定向它的调用点**：x86 认 `e8 rel32`、arm64 认 `bl imm26`，
 目标地址按 VA 现算现比，换了版本也不用改脚本（当前两架构各 14 处）。
 钩子在请求 `.html` 时按 8 字节字扫一遍缓冲（`memchr` 在这个二进制里没被导入，
-所以自己做了个 `(x-0x01..) & ~x & 0x80..` 的跳过），把
+所以自己做了个 `(x-0x01..) & ~x & 0x80..` 的跳过），做两处**等长替换**：
 
 ```
-g_current_edition = 0;      →      g_current_edition = 1;
+index.html          g_current_edition = 0;            ->  g_current_edition = 1;
+vtoy_register.html  g_current_edition = data.edition; ->  g_current_edition = 1
 ```
 
-改掉，然后照原样调用原函数。页面长度不变、tar 结构不变、签名也不动。
-日志里能对上：`[HOOK] matrix boot: unlocked 1 web UI edition gate(s)`。
+第二处是「版本信息」页自己把全局值覆盖回服务端返回的 `edition`（免费版那个字段是硬编码
+的 `xor r8d,r8d`，不是算出来的），不盖掉它的话页头显示 Pro、页脚和版本类型又变回
+「免费版本 + 注册成为专业版本」。替换成常量后页面走 `g_current_edition === 1` 分支，
+显示「专业版本」，注册链接与免费版提示都不再出现。
+
+页面长度、tar 结构、RSA 签名全不变。日志里能对上：
+`[HOOK] matrix boot: unlocked 2 web UI edition gate(s)`。
 
 ### 怎么验
 
