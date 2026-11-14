@@ -53,7 +53,21 @@
 | 文件 | 作用 |
 |---|---|
 | `matrix_boot_add.c` | 四个入口：`matrix_boot_add_api` / `matrix_boot_clr_api`（新增、清除）、`matrix_boot_walk_hook`（启动恢复时把记录放回链表）、`buf2file_hook`（配置落盘串行化），外加 `tarfs_find_hook`（拆 WebUI 前台闸门） |
-| `matrix_boot_hook.py` | 把上面的 C 编成机器码块，找可执行落点（RX 段尾部的**全零填充**优先，放不下就追加到文件尾并延长 `p_filesz`），把桩改成 `jmp` / `b`，并把 `toy_tarfs_find_file` 的调用点重定向；带 `--verify` 与 `--check` |
+| `matrix_boot_hook.py` | 把上面的 C 编成机器码块，找可执行落点（RX 段尾部的**全零填充**优先；放不下就追加到文件尾；追加会压到下一个段时，把一条 `PT_NOTE` 改造成新的 RX 段），把桩改成 `jmp` / `b`，并把 `toy_tarfs_find_file` 的调用点重定向；带 `--verify` 与 `--check` |
+
+### 落点：三种，按顺序试
+
+| 方式 | 条件 | 用在 |
+|---|---|---|
+| `segment-gap` | RX 段尾部到下一个段之间有全零填充，且装得下代码块 | 1.0.49 两架构 |
+| `file-append` | 追加到文件尾后算出的 VA 仍小于下一个段的起始 VA | 1.0.49 amd64、1.0.50 amd64 |
+| `new-segment` | 前两种都不行：把一条 `PT_NOTE` 改写成 `PT_LOAD`（R+X），代码块落在文件尾的新 VA | **1.0.50 arm64** |
+
+1.0.50 的 arm64 就是第三种：RX 段 `[0x400000,0x708C0C)`，下一个 RW 段从 `0x718DD8` 开始 ——
+文件里只剩 460 字节空隙，而按文件尾追加算出来的 VA（0x73B000）会落进 RW 段里，两条
+`PT_LOAD` 的 VA 直接打架。`PT_NOTE` 只是 build-id 的载体，改造成 `PT_LOAD` 不影响运行
+（build-id 在 section 里还在，只是 phdrs 里没有那条 note 了），报告里会记
+`"placement": "new-segment"` 与 `segment` 字段，`--verify` 会核对新段的 VA/偏移/长度。
 
 记录布局由 `toy_matrix_boot_list_json` 反推：`+0x00 bios(u8)` / `+0x04 timeout(u32)` /
 `+0x08 mac[18]` / `+0x1a path`，整条 `0x101c` 字节。地址全部现场从符号表 / PLT 解析，
@@ -118,9 +132,13 @@ vtoy_register.html  g_current_edition = data.edition; ->  g_current_edition = 1
 页面长度、tar 结构、RSA 签名全不变。日志里能对上：
 `[HOOK] matrix boot: unlocked 2 web UI edition gate(s)`。
 
-**只有这两个页面会触发扫描**（根路径也走这条，服务端最终落到 `index.html`；`find_file`
-内部那次递归调用同样被重定向到钩子）。面板页和静态资源零开销 —— RK3566 上实测扫描一次
+**只有这几个资源会触发扫描**（根路径也走这条，服务端最终落到 `index.html`；`find_file`
+内部那次递归调用同样被重定向到钩子）。面板页和纯静态资源零开销 —— RK3566 上实测扫描一次
 是 76ms，收紧前每个 `.html` 请求都要付这个钱，点一下面板就卡一下。
+
+赋初值的位置会随上游版本搬家：1.0.49 在 `index.html`，1.0.50 挪到了
+`static/js/vtoy.js`（`vtoy_common_fill_sysinfo` 里）。所以触发名单是
+`index.html` / `vtoy_register` / `vtoy.js` 三个，替换语句本身两版相同。
 
 ### 怎么验
 

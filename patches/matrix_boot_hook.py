@@ -154,22 +154,52 @@ def compile_blob(machine: int, text_va: int, syms: dict[str, int], src: Path):
 
 
 def plan_placement(data: bytes, rx, nxt, blob_len: int):
-    """决定代码块落在哪：RX 段尾部的全零填充，或追加到文件尾。"""
+    """决定代码块落在哪：RX 段尾部的全零填充，或追加到文件尾。
+
+    尾部填充不是全零、或者追加会把 VA 顶进下一个段时，返回 (None, 原因)，
+    由调用方改走 plan_new_segment。
+    """
     rx_end_file = rx["offset"] + rx["filesz"]
     rx_end_va = rx["vaddr"] + (rx_end_file - rx["offset"])
     gap_file = (nxt["offset"] - rx_end_file) if nxt else 0
     gap_va = (nxt["vaddr"] - rx_end_va) if nxt else 0x1000000
     if blob_len <= gap_file and blob_len <= gap_va:
-        if any(data[rx_end_file:rx_end_file + blob_len]):
-            return None, "RX 段尾部填充不是全零，不能直接覆盖"
-        return ("segment-gap", rx_end_file, rx_end_va, rx["filesz"] + blob_len), None
+        if not any(data[rx_end_file:rx_end_file + blob_len]):
+            return ("segment-gap", rx_end_file, rx_end_va, rx["filesz"] + blob_len), None
+        reason = "RX 段尾部填充不是全零"
+    else:
+        reason = ("RX 尾部空隙不够（文件 %d / VA %d 字节，需要 %d）"
+                  % (gap_file, gap_va, blob_len))
     cave_off = (len(data) + 0xFFF) & ~0xFFF
     cave_va = rx["vaddr"] + (cave_off - rx["offset"])
     if nxt and cave_va + blob_len > nxt["vaddr"]:
-        return None, ("尾部落点 0x%X..0x%X 会压到下一个段 0x%X"
-                      % (cave_va, cave_va + blob_len, nxt["vaddr"]))
+        return None, ("%s；追加到文件尾会压到下一个段 0x%X（落点 0x%X..0x%X）"
+                      % (reason, nxt["vaddr"], cave_va, cave_va + blob_len))
     return ("file-append", cave_off, cave_va,
             cave_off + blob_len - rx["offset"]), None
+
+
+def plan_new_segment(data: bytes, blob_len: int):
+    """把一条 PT_NOTE 改造成新的 RX 段，代码块放到文件尾。
+
+    1.0.50 的 arm64 就是这种情况：RX 段 [0x400000,0x708C0C)，下一个 RW 段从 0x718DD8
+    开始 —— 文件里只剩 460 字节空隙，而按文件尾追加算出来的 VA 会落进 RW 段里，两条
+    PT_LOAD 的 VA 就打架了。
+
+    PT_NOTE 只是 build-id 的载体：改造成 PT_LOAD 不影响运行（build-id 在 section 里
+    还在，只是 phdrs 里不再有那条 note）。新段放在所有已有段之后、按 64KB 对齐。
+    """
+    plist = phdrs(data)
+    loads = [p for p in plist if p["type"] == 1]
+    note = next((p for p in plist if p["type"] == 4), None)
+    if note is None:
+        return None, "找不到 PT_NOTE，无法新增段"
+    end_va = max(p["vaddr"] + p["memsz"] for p in loads)
+    cave_va = (end_va + 0xFFFF) & ~0xFFFF
+    if any(p["vaddr"] <= cave_va < p["vaddr"] + p["memsz"] for p in loads):
+        return None, "新段 VA 0x%X 与已有段重叠" % cave_va
+    cave_off = (len(data) + 0xFFF) & ~0xFFF
+    return ("new-segment", cave_off, cave_va, note), None
 
 
 def make_jump(machine: int, from_va: int, to_va: int, length: int) -> bytes:
@@ -280,6 +310,18 @@ def verify(binary: str, report_path: str) -> int:
             break
     else:
         raise SystemExit("FAIL: 找不到记录的 program header")
+    seg = rep.get("segment")
+    if seg:
+        entry = next((p for p in phdrs(data) if p["off"] == seg["phdr_off"]), None)
+        if entry is None or entry["type"] != 1:
+            print("FAIL: 新增的 PT_LOAD 不在报告记录的位置", file=sys.stderr)
+            return 1
+        if entry["vaddr"] != int(seg["va"], 16):
+            print("FAIL: 新增 PT_LOAD 的 VA 与报告不符", file=sys.stderr)
+            return 1
+        if entry["filesz"] != seg["filesz"] or entry["offset"] != rep["cave_off"]:
+            print("FAIL: 新增 PT_LOAD 的偏移/长度与报告不符", file=sys.stderr)
+            return 1
     print("OK: 分机独启钩子在位（cave 0x%X，%d 字节，%d 个入口，%d 个调用点）"
           % (rep["cave_va"], rep["blob_len"], len(rep["stubs"]),
              len(rep.get("callsites", []))))
@@ -381,21 +423,28 @@ def main() -> int:
     blob, blob_elf = compile_blob(machine, rx_end_va, syms, src)
     placement, err = plan_placement(bytes(data), rx, nxt, len(blob))
     if placement is None:
-        if "不是全零" not in (err or ""):
-            raise SystemExit(err)
-        placement = None
-    if placement is None or placement[0] == "file-append":
-        cave_off = (len(data) + 0xFFF) & ~0xFFF
-        cave_va = rx["vaddr"] + (cave_off - rx["offset"])
+        seg, err2 = plan_new_segment(bytes(data), len(blob))
+        if seg is None:
+            raise SystemExit("%s；改造成新段也不行：%s" % (err, err2))
+        placement = seg
+    kind, cave_off, cave_va, extra = placement
+    if kind != "segment-gap":
         blob, blob_elf = compile_blob(machine, cave_va, syms, src)
-        placement, err = plan_placement(bytes(data), rx, nxt, len(blob))
-        if placement is None:
-            raise SystemExit(err)
 
-    kind, cave_off, cave_va, new_filesz = placement
     rx_hi_orig = rx["offset"] + rx["filesz"]          # 重定向只扫原始代码，别扫到代码块
-    struct.pack_into("<Q", data, rx["off"] + 32, new_filesz)     # p_filesz
-    struct.pack_into("<Q", data, rx["off"] + 40, new_filesz)     # p_memsz
+    if kind == "new-segment":
+        ph = extra
+        struct.pack_into("<I", data, ph["off"], 1)                # p_type   = PT_LOAD
+        struct.pack_into("<I", data, ph["off"] + 4, 5)            # p_flags  = R|X
+        struct.pack_into("<Q", data, ph["off"] + 8, cave_off)     # p_offset
+        struct.pack_into("<Q", data, ph["off"] + 16, cave_va)     # p_vaddr
+        struct.pack_into("<Q", data, ph["off"] + 24, cave_va)     # p_paddr
+        struct.pack_into("<Q", data, ph["off"] + 32, len(blob))   # p_filesz
+        struct.pack_into("<Q", data, ph["off"] + 40, len(blob))   # p_memsz
+        struct.pack_into("<Q", data, ph["off"] + 48, 0x1000)      # p_align
+    else:
+        struct.pack_into("<Q", data, rx["off"] + 32, extra)       # p_filesz
+        struct.pack_into("<Q", data, rx["off"] + 40, extra)       # p_memsz
     if cave_off > len(data):
         data.extend(b"\x00" * (cave_off - len(data)))
     data[cave_off:cave_off + len(blob)] = blob
@@ -427,6 +476,8 @@ def main() -> int:
 
     out = bytes(data)
     path.write_bytes(out)
+    rx_filesz_now = struct.unpack_from("<Q", data, rx["off"] + 32)[0]
+    rx_memsz_now = struct.unpack_from("<Q", data, rx["off"] + 40)[0]
     report = {
         "binary": str(path),
         "arch": ARCH_NAME[machine],
@@ -440,10 +491,14 @@ def main() -> int:
         "stubs": patched,
         "callsites": callsites,
         "phdr_off": rx["off"],
-        "rx_filesz": new_filesz,
-        "rx_memsz": new_filesz,
+        "rx_filesz": rx_filesz_now,
+        "rx_memsz": rx_memsz_now,
         "resolved": {k: "0x%X" % v for k, v in syms.items()},
     }
+    if kind == "new-segment":
+        report["segment"] = {"phdr_off": extra["off"], "va": "0x%X" % cave_va,
+                             "filesz": len(blob)}
+        report["notes"] = ["PT_NOTE 被改造成装载代码块的 PT_LOAD（build-id 仍在 section 里）"]
     Path(args.report).write_text(json.dumps(report, indent=2) + "\n")
     print("分机独启钩子: %s %s，代码块 %d 字节 @0x%X，接管 %d 个入口"
           % (report["arch"], kind, len(blob), cave_va, len(patched)))

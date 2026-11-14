@@ -194,9 +194,14 @@ jobs:
           set -uo pipefail
           OUT="${RUNNER_TEMP}/prev-digests.tsv"
           : > "${OUT}"
+          # [iventoy-fork] 两个坑，2026-11-13 那次 1.0.49 -> 1.0.50 就死在这里，构建根本没开始：
+          # 1) TAGS 里会有重复（同一个 latest 按 docker.io / ghcr 各来一遍），先按行去重；
+          # 2) 新版本号第一次发布时 tag 还不存在，imagetools 返回非零，配合 set -e + pipefail
+          #    直接把整步打红。这里显式吞掉退出码，只当「没有旧值、回滚时跳过」。
+          TAGS_UNIQ=$(printf '%s\n' "${TAGS}" | awk 'NF && !seen[$0]++')
           while IFS= read -r tag; do
             [ -n "$tag" ] || continue
-            D=$(docker buildx imagetools inspect "$tag" 2>/dev/null \
+            D=$( { docker buildx imagetools inspect "$tag" 2>/dev/null || true; } \
                 | awk '/^Digest:/{print $2; exit}')
             if [ -n "${D}" ]; then
               printf '%s\t%s\n' "$tag" "${D}" >> "${OUT}"
@@ -204,7 +209,7 @@ jobs:
             else
               echo "现有 ${tag} -> <不存在，回滚时跳过>"
             fi
-          done <<< "${TAGS}"
+          done <<< "${TAGS_UNIQ}"
           echo "记录条数：$(wc -l < "${OUT}")"
 
       - name: Build and push（强制覆盖 latest / 版本号）
@@ -343,12 +348,17 @@ jobs:
               # [iventoy-fork L2] 三个按钮在免费版里还有一道前台闸门：matrix-boot.html 里
               # if (g_current_edition === 0) 直接弹「此功能只在专业版本中支持」，接口根本
               # 不会被调用。钩子在 tarfs 内存里把这个赋值改成了 1，这里确认页面真的是拆过的。
-              if ! curl -s --max-time 10 http://127.0.0.1:26000/ | grep -q 'g_current_edition = 1;'; then
-                echo "::error::${arch} WebUI 前台闸门没拆开（index.html 里还是 g_current_edition = 0）"
-                curl -s --max-time 10 http://127.0.0.1:26000/ | grep -o 'g_current_edition = [0-9];' | head -2 | sed 's/^/    /'
+              # 赋初值的位置随上游版本变：1.0.49 在 index.html，1.0.50 挪到了
+              # static/js/vtoy.js（vtoy_common_fill_sysinfo 里）。两处都查，任一命中即算拆开。
+              gate=$( { curl -s --max-time 10 http://127.0.0.1:26000/ || true; } | grep -o 'g_current_edition = 1[^;]*;' | head -1)
+              [ -n "${gate}" ] || gate=$( { curl -s --max-time 10 http://127.0.0.1:26000/static/js/vtoy.js || true; } | grep -o 'g_current_edition = 1[^;]*;' | head -1)
+              if [ -z "${gate}" ]; then
+                echo "::error::${arch} WebUI 前台闸门没拆开（index.html / vtoy.js 里都还是 0）"
+                { curl -s --max-time 10 http://127.0.0.1:26000/ || true; } | grep -o 'g_current_edition[^;]*;' | head -3 | sed 's/^/    /'
+                { curl -s --max-time 10 http://127.0.0.1:26000/static/js/vtoy.js || true; } | grep -o 'g_current_edition[^;]*;' | head -3 | sed 's/^/    /'
                 rc=1
               else
-                echo "  ${arch} WebUI 前台闸门已拆"
+                echo "  ${arch} WebUI 前台闸门已拆（${gate}）"
                 # 「版本信息」页会把全局值覆盖回服务端返回的 edition（免费版硬编码 0），
                 # 不盖掉它页脚又会变回「免费版本」。这里确认那一处也被替换成了常量 1。
                 if ! curl -s --max-time 10 http://127.0.0.1:26000/vtoy_register.html | grep -q 'g_current_edition = 1 '; then
@@ -530,3 +540,62 @@ jobs:
             echo "| 客户端上限 | ${PATCHED} |"
             echo "| digest | \`${DIGEST:-<未知>}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # [iventoy-fork] 失败必须留下能接手的产物。以前只把 run 标红：ghcr 镜像停在旧版，
+  # 也没有任何 issue / PR，等于要人天天盯 Actions 列表才发现（2026-11-13 的 #33 就是这样）。
+  # 现在失败时把 run 链接、失败步骤、日志尾部与复现命令写成 dsh-handoff issue；
+  # 同一个版本的 issue 已存在就追加评论，不重复开。
+  handoff:
+    needs: build
+    if: failure()
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 汇总失败上下文
+        id: ctx
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          V=$(sed -n 's/.*IVENTOY_VERSION:-\([0-9][0-9.]*\).*/\1/p' Dockerfile | head -1)
+          echo "title=构建失败: iVentoy ${V:-unknown}" >> "${GITHUB_OUTPUT}"
+          {
+            echo "## 构建失败：iVentoy ${V:-<未知版本>}"
+            echo
+            echo "- 提交：\`${{ github.sha }}\`"
+            echo "- 触发：\`${{ github.event_name }}\`（\`${{ github.ref_name }}\`）"
+            echo "- 运行：${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "- ghcr 镜像：仍是上一版（本次没有推送成功）"
+            echo
+            echo "### 失败步骤日志（尾部 120 行）"
+            echo '```'
+            gh run view "${{ github.run_id }}" --log-failed 2>/dev/null | tail -120 || echo '<取不到日志>'
+            echo '```'
+            echo
+            echo "### 接手怎么做"
+            echo
+            echo '```bash'
+            echo "# 拉上游包（版本见 Dockerfile 的 IVENTOY_VERSION）"
+            echo "curl -sSL -O https://github.com/ventoy/PXE/releases/download/v<版本>/iventoy-<版本>-linux-x86_64-free.tar.gz"
+            echo "tar -xzf iventoy-*.tar.gz -C /tmp/x --strip-components=1"
+            echo "# 复现补丁链（两架构各一遍；arm64 包名是 -linux-arm64-trial）"
+            echo "python3 patches/iventoy_patch.py --max-clients 65535 --report /tmp/p1.json /tmp/x/lib/iventoy"
+            echo "python3 patches/matrix_boot_hook.py /tmp/x/lib/iventoy --report /tmp/p2.json"
+            echo "python3 patches/matrix_boot_hook.py /tmp/x/lib/iventoy --verify /tmp/p2.json"
+            echo '```'
+            echo
+            echo "补丁站点表与适配方法见 \`patches/README.md\`。"
+            echo "构建期若报「符号找不到 / 大小不合理 / 落点放不下」，通常是上游改了这两处："
+            echo "桩函数的形态、或 RX 段的尾部空隙大小。"
+          } > /tmp/handoff.md
+          cat /tmp/handoff.md
+
+      - uses: ./.github/actions/handoff
+        with:
+          title: ${{ steps.ctx.outputs.title }}
+          body-file: /tmp/handoff.md

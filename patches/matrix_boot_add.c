@@ -316,7 +316,10 @@ static int str_has(const char *s, const char *needle)
     return 0;
 }
 
-/* 只有这两个页面需要改写：index.html（全局赋 0）和 vtoy_register.html（覆盖回服务端值）。
+/* 只有这几个资源需要改写：
+ *   1.0.49  index.html          里有 g_current_edition = 0;
+ *   1.0.50  static/js/vtoy.js   里（vtoy_common_fill_sysinfo）才赋初值，index.html 只剩判断
+ *   两版都有 vtoy_register.html 把全局值覆盖回服务端返回值
  * 不加这个判断的话每个 .html 请求都要扫一遍几十 MB 的缓冲 —— 实测 RK3566 上一次 76ms，
  * 而静态资源只要 1.5ms，面板点一下就卡半秒。
  *
@@ -326,7 +329,8 @@ static int is_ui_page(const char *path)
 {
     usize i;
 
-    if (str_has(path, "index.html") || str_has(path, "vtoy_register"))
+    if (str_has(path, "index.html") || str_has(path, "vtoy_register") ||
+        str_has(path, "vtoy.js"))
         return 1;
     for (i = 0; path[i]; i++) {
         if (path[i] == '.')

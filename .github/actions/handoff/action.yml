@@ -1,0 +1,41 @@
+name: 失败交接（DSH）
+description: >-
+  构建 / 上游跟踪失败时，把上下文写成一个带 dsh-handoff 标签的 issue；同名 issue
+  已存在就追加评论，避免定时任务每次失败都开新 issue。
+
+inputs:
+  title:
+    description: issue 标题（同名视为同一个问题，重复失败会追加评论）
+    required: true
+  body-file:
+    description: issue 正文文件路径（markdown）
+    required: true
+  label:
+    description: 标签名
+    required: false
+    default: dsh-handoff
+
+runs:
+  using: composite
+  steps:
+    - name: 创建或追加 issue
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        TITLE: ${{ inputs.title }}
+        BODY_FILE: ${{ inputs.body-file }}
+        LABEL: ${{ inputs.label }}
+      run: |
+        set -uo pipefail
+        # 标签不存在就先建（重复创建会报错，忽略）
+        gh label create "$LABEL" --color B60205 \
+          --description "需要人工或 DSH 接手" >/dev/null 2>&1 || true
+        NUM=$(gh issue list --label "$LABEL" --state open --limit 100 \
+                --json number,title \
+                --jq '[.[] | select(.title == env.TITLE)] | .[0].number // empty')
+        if [ -n "${NUM}" ]; then
+          gh issue comment "$NUM" --body-file "$BODY_FILE"
+          echo "已追加到 issue #${NUM}"
+        else
+          gh issue create --title "$TITLE" --label "$LABEL" --body-file "$BODY_FILE"
+        fi
