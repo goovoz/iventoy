@@ -5,6 +5,7 @@
 .github/workflows/cleanup-package.yml
 .github/workflows/ci-validate.yml
 .github/fork-paths.txt
+.github/actions/handoff/action.yml
 docs/UPSTREAM-SYNC.md
 .dockerignore
 .gitignore

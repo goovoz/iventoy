@@ -33,6 +33,8 @@ permissions:
   # （2026-10-21 故障：仅写 contents: write 时，1.0.45->1.0.46 的自动更新推送/打标签成功，
   #  但派发镜像构建 403 失败，导致 ghcr 镜像没有跟着更新）。
   actions: write
+  # [iventoy-fork] 失败时要写 dsh-handoff issue，见文件末尾的 handoff job
+  issues: write
 
 concurrency:
   group: track-iventoy-release
@@ -475,3 +477,50 @@ jobs:
               echo "| 镜像构建 | 派发成功但未确认结果（${BUILD:-unknown}） |"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # [iventoy-fork] 跟踪失败（上游更新推送了、但镜像构建红/派发失败）时同样要交接：
+  # 以前只在 run summary 里写「需人工处理」，没有任何 issue，DSH 接不到。
+  handoff:
+    needs: track
+    if: failure()
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 汇总失败上下文
+        id: ctx
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          V=$(sed -n 's/.*IVENTOY_VERSION:-\([0-9][0-9.]*\).*/\1/p' Dockerfile | head -1)
+          echo "title=上游跟踪失败: iVentoy ${V:-unknown}" >> "${GITHUB_OUTPUT}"
+          {
+            echo "## 上游跟踪失败：iVentoy ${V:-<未知版本>}"
+            echo
+            echo "- 提交：\`${{ github.sha }}\`"
+            echo "- 运行：${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo
+            echo "### 失败日志（尾部 120 行）"
+            echo '```'
+            gh run view "${{ github.run_id }}" --log-failed 2>/dev/null | tail -120 || echo '<取不到日志>'
+            echo '```'
+            echo
+            echo "### 接手怎么做"
+            echo
+            echo "1. 先看本次 run summary 的「镜像构建」一行："
+            echo "   - 派发失败（403 等）→ 查 workflow 的 actions: write 权限与 token；"
+            echo "   - 构建失败 → 打开被派发的那次 Build and Push，那里会另有一条 handoff issue。"
+            echo "2. 构建失败若出在补丁阶段，按 \`patches/README.md\` 的站点表核对签名，"
+            echo "   常见是上游改了桩函数形态或 RX 段尾部空隙。"
+          } > /tmp/handoff.md
+          cat /tmp/handoff.md
+
+      - uses: ./.github/actions/handoff
+        with:
+          title: ${{ steps.ctx.outputs.title }}
+          body-file: /tmp/handoff.md
