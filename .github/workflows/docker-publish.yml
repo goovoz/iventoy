@@ -350,12 +350,21 @@ jobs:
               # 不会被调用。钩子在 tarfs 内存里把这个赋值改成了 1，这里确认页面真的是拆过的。
               # 赋初值的位置随上游版本变：1.0.49 在 index.html，1.0.50 挪到了
               # static/js/vtoy.js（vtoy_common_fill_sysinfo 里）。两处都查，任一命中即算拆开。
-              gate=$( { curl -s --max-time 10 http://127.0.0.1:26000/ || true; } | grep -o 'g_current_edition = 1[^;]*;' | head -1)
-              [ -n "${gate}" ] || gate=$( { curl -s --max-time 10 http://127.0.0.1:26000/static/js/vtoy.js || true; } | grep -o 'g_current_edition = 1[^;]*;' | head -1)
+              # 注意：这里的 grep 必须自带 `|| true`。脚本是 set -euo pipefail，
+              # 「没匹配到」的 grep 返回 1 会把整步直接打死 —— #34 就是这么红的：
+              # 1.0.50 的 index.html 里本来就没有这句，第一个探针一失配就退出了。
+              gate=""
+              for probe in / /static/js/vtoy.js; do
+                [ -n "${gate}" ] && break
+                body=$(curl -s --max-time 10 "http://127.0.0.1:26000${probe}" || true)
+                gate=$(printf '%s' "${body}" | grep -o 'g_current_edition = 1[^;]*;' | head -1 || true)
+              done
               if [ -z "${gate}" ]; then
                 echo "::error::${arch} WebUI 前台闸门没拆开（index.html / vtoy.js 里都还是 0）"
-                { curl -s --max-time 10 http://127.0.0.1:26000/ || true; } | grep -o 'g_current_edition[^;]*;' | head -3 | sed 's/^/    /'
-                { curl -s --max-time 10 http://127.0.0.1:26000/static/js/vtoy.js || true; } | grep -o 'g_current_edition[^;]*;' | head -3 | sed 's/^/    /'
+                for probe in / /static/js/vtoy.js; do
+                  printf '%s' "$(curl -s --max-time 10 "http://127.0.0.1:26000${probe}" || true)" \
+                    | grep -o 'g_current_edition[^;]*;' | head -3 | sed 's/^/    /' || true
+                done
                 rc=1
               else
                 echo "  ${arch} WebUI 前台闸门已拆（${gate}）"
@@ -363,7 +372,8 @@ jobs:
                 # 不盖掉它页脚又会变回「免费版本」。这里确认那一处也被替换成了常量 1。
                 if ! curl -s --max-time 10 http://127.0.0.1:26000/vtoy_register.html | grep -q 'g_current_edition = 1 '; then
                   echo "::error::${arch} 版本信息页仍把 edition 覆盖回服务端值（页脚会显示免费版本）"
-                  curl -s --max-time 10 http://127.0.0.1:26000/vtoy_register.html | grep -o 'g_current_edition = [^;]*;' | head -2 | sed 's/^/    /'
+                  curl -s --max-time 10 http://127.0.0.1:26000/vtoy_register.html \
+                    | grep -o 'g_current_edition = [^;]*;' | head -2 | sed 's/^/    /' || true
                   rc=1
                 else
                   echo "  ${arch} 版本信息页 edition 已是常量"
